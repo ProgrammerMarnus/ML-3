@@ -1,149 +1,152 @@
-"""Alpaca paper-trading client wrapper.
-
-Falls back to a dry-run (log-only) mode when ``alpaca-py`` is not
-installed or credentials are missing, so the paper-trader script
-can still be exercised without live keys.
+"""
+Alpaca Markets API Client for live trading.
+Supports both paper and live trading modes.
 """
 
-from __future__ import annotations
-
 import os
-from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Dict, List, Optional, Any
+import pandas as pd
 
-try:  # pragma: no cover - optional dependency
+try:
     from alpaca.trading.client import TradingClient
-    from alpaca.trading.requests import MarketOrderRequest
-    from alpaca.trading.enums import OrderSide, TimeInForce
+    from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
     from alpaca.data.historical import StockHistoricalDataClient
-    from alpaca.data.requests import StockLatestQuoteRequest
-
-    _ALPACA_AVAILABLE = True
-except Exception:  # pragma: no cover
-    TradingClient = None  # type: ignore
-    MarketOrderRequest = None  # type: ignore
-    OrderSide = None  # type: ignore
-    TimeInForce = None  # type: ignore
-    StockHistoricalDataClient = None  # type: ignore
-    StockLatestQuoteRequest = None  # type: ignore
-    _ALPACA_AVAILABLE = False
+    from alpaca.data.requests import StockBarsRequest
+    ALPACA_AVAILABLE = True
+except ImportError:
+    ALPACA_AVAILABLE = False
+    TradingClient = None
 
 
-def is_alpaca_available() -> bool:
-    """Return True when the ``alpaca-py`` package is importable."""
-    return _ALPACA_AVAILABLE
-
-
-@dataclass
-class AlpacaPaperClient:
-    """Thin wrapper around Alpaca paper trading.
-
-    Parameters
-    ----------
-    api_key, secret_key, base_url:
-        Alpaca credentials. Defaults are read from the environment
-        (``APCA_API_KEY_ID`` / ``APCA_API_SECRET_KEY`` /
-        ``APCA_API_BASE_URL``) which are loaded from ``.env``.
-    paper:
-        Always True - this client is paper-only by design.
-    dry_run:
-        When True (or when alpaca-py/creds are missing) orders are
-        logged instead of submitted.
+class AlpacaClient:
     """
-
-    api_key: Optional[str] = None
-    secret_key: Optional[str] = None
-    base_url: str = "https://paper-api.alpaca.markets"
-    paper: bool = True
-    dry_run: bool = False
-
-    def __post_init__(self) -> None:
-        self.api_key = self.api_key or os.getenv("APCA_API_KEY_ID")
-        self.secret_key = self.secret_key or os.getenv("APCA_API_SECRET_KEY")
-        self.base_url = os.getenv("APCA_API_BASE_URL", self.base_url)
-        if not _ALPACA_AVAILABLE or not self.api_key or not self.secret_key:
-            self.dry_run = True
-            self._trading = None
-            self._data = None
-        else:
-            self._trading = TradingClient(
-                self.api_key, self.secret_key, paper=True, url_override=self.base_url
+    Client for interacting with Alpaca Markets API.
+    
+    Supports:
+    - Real-time market data
+    - Order execution (market/limit)
+    - Portfolio management
+    - Paper trading mode
+    """
+    
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        secret_key: Optional[str] = None,
+        paper: bool = True,
+    ):
+        if not ALPACA_AVAILABLE:
+            raise ImportError(
+                "alpaca-py is required. Install with: pip install alpaca-py"
             )
-            self._data = StockHistoricalDataClient(self.api_key, self.secret_key)
-
-    @property
-    def live(self) -> bool:
-        """True when orders will actually be submitted."""
-        return not self.dry_run
-
+        
+        self.api_key = api_key or os.getenv("ALPACA_API_KEY")
+        self.secret_key = secret_key or os.getenv("ALPACA_SECRET_KEY")
+        self.paper = paper
+        
+        if not self.api_key or not self.secret_key:
+            raise ValueError(
+                "Alpaca API credentials required. Set ALPACA_API_KEY and ALPACA_SECRET_KEY env vars."
+            )
+        
+        # Initialize trading client
+        self.trading_client = TradingClient(
+            api_key=self.api_key,
+            secret_key=self.secret_key,
+            paper=paper,
+        )
+        
+        # Initialize data client
+        self.data_client = StockHistoricalDataClient(
+            api_key=self.api_key,
+            secret_key=self.secret_key,
+        )
+        
     def get_account(self) -> Dict[str, Any]:
-        """Return account snapshot (or dry-run placeholder)."""
-        if self.dry_run or self._trading is None:
-            return {
-                "mode": "dry_run",
-                "equity": None,
-                "cash": None,
-                "buying_power": None,
-            }
-        acct = self._trading.get_account()
+        """Get account information."""
+        account = self.trading_client.get_account()
         return {
-            "mode": "paper",
-            "equity": float(acct.equity),
-            "cash": float(acct.cash),
-            "buying_power": float(acct.buying_power),
+            "cash": float(account.cash),
+            "portfolio_value": float(account.portfolio_value),
+            "buying_power": float(account.buying_power),
+            "equity": float(account.equity),
+            "last_equity": float(account.last_equity),
         }
-
-    def get_position_qty(self, symbol: str) -> float:
-        """Return current position qty for ``symbol`` (0 when flat/dry-run)."""
-        if self.dry_run or self._trading is None:
-            return 0.0
-        try:
-            pos = self._trading.get_open_position(symbol)
-            return float(pos.qty)
-        except Exception:
-            return 0.0
-
-    def get_latest_price(self, symbol: str) -> Optional[float]:
-        """Return latest quote mid-price, or None when unavailable."""
-        if self.dry_run or self._data is None:
-            return None
-        try:
-            req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
-            quotes = self._data.get_stock_latest_quote(req)
-            q = quotes[symbol]
-            return float((float(q.ask_price) + float(q.bid_price)) / 2.0)
-        except Exception:
-            return None
-
+    
+    def get_positions(self) -> List[Dict[str, Any]]:
+        """Get current positions."""
+        positions = self.trading_client.get_all_positions()
+        return [
+            {
+                "symbol": p.symbol,
+                "qty": float(p.qty),
+                "avg_entry_price": float(p.avg_entry_price),
+                "current_price": float(p.current_price),
+                "unrealized_pl": float(p.unrealized_pl),
+            }
+            for p in positions
+        ]
+    
     def submit_market_order(
-        self, symbol: str, qty: float, side: str
+        self,
+        symbol: str,
+        qty: float,
+        side: str,  # "buy" or "sell"
     ) -> Dict[str, Any]:
-        """Submit a market order (or log it in dry-run mode).
-
-        Parameters
-        ----------
-        symbol: ticker, e.g. ``"AAPL"``.
-        qty: positive share quantity.
-        side: ``"buy"`` or ``"sell"``.
-        """
-        qty = abs(float(qty))
-        if qty <= 0:
-            return {"status": "skipped", "reason": "qty<=0"}
-        if self.dry_run or self._trading is None:
-            print(f"[DRY-RUN] {side.upper()} {qty:.4f} {symbol} @ market")
-            return {"status": "dry_run", "symbol": symbol, "qty": qty, "side": side}
-        order_side = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
-        req = MarketOrderRequest(
+        """Submit a market order."""
+        from alpaca.trading.requests import MarketOrderRequest
+        from alpaca.trading.enums import OrderSide, TimeInForce
+        
+        order_request = MarketOrderRequest(
             symbol=symbol,
             qty=qty,
-            side=order_side,
+            side=OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL,
             time_in_force=TimeInForce.DAY,
         )
-        order = self._trading.submit_order(req)
+        
+        order = self.trading_client.submit_order(order_request)
         return {
-            "status": "submitted",
-            "symbol": symbol,
-            "qty": qty,
-            "side": side,
-            "order_id": str(order.id),
+            "id": order.id,
+            "symbol": order.symbol,
+            "qty": float(order.qty),
+            "side": order.side.value,
+            "status": order.status,
         }
+    
+    def get_historical_data(
+        self,
+        symbol: str,
+        timeframe: str = "1Day",
+        start: str = "2020-01-01",
+        end: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """Get historical bar data."""
+        from datetime import datetime
+        
+        if end is None:
+            end = datetime.now().strftime("%Y-%m-%d")
+        
+        request_params = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=timeframe,
+            start=start,
+            end=end,
+        )
+        
+        bars = self.data_client.get_stock_bars(request_params)
+        data = bars.df
+        
+        if len(data) == 0:
+            return pd.DataFrame()
+        
+        # Reset index to get date column
+        data = data.reset_index()
+        data.columns = ["timestamp", "open", "high", "low", "close", "volume"]
+        data["Date"] = pd.to_datetime(data["timestamp"]).dt.date
+        data = data.set_index("Date")
+        
+        return data[["open", "high", "low", "close", "volume"]]
+    
+    def cancel_all_orders(self) -> None:
+        """Cancel all open orders."""
+        self.trading_client.cancel_orders()
