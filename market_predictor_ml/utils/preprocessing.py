@@ -107,9 +107,9 @@ def winsorize_features(
         X_array = X.values
     else:
         X_array = X
-    
+
     X_winsorized = X_array.copy()
-    
+
     for i in range(X_winsorized.shape[1]):
         lower = np.percentile(X_winsorized[:, i], lower_percentile)
         upper = np.percentile(X_winsorized[:, i], upper_percentile)
