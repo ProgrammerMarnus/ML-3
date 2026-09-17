@@ -51,7 +51,8 @@ def compute_direction_labels(
     df: pd.DataFrame,
     horizon: int = 5,
     threshold: float = 0.0,
-    include_neutral: bool = True
+    include_neutral: bool = True,
+    horizons: Optional[list[int]] = None,
 ) -> pd.DataFrame:
     """
     Create directional labels based on future returns.
@@ -73,6 +74,15 @@ def compute_direction_labels(
         DataFrame with direction labels (1=up, 0=neutral/-1=down)
     """
     df = df.copy()
+
+    # Accept a list of horizons, mirroring compute_future_returns(horizons=...)
+    if horizons:
+        for h in horizons:
+            df = compute_direction_labels(
+                df, horizon=h, threshold=threshold,
+                include_neutral=include_neutral,
+            )
+        return df
     
     # Compute future return
     future_return = df['Close'].shift(-horizon) / df['Close'] - 1
@@ -85,7 +95,7 @@ def compute_direction_labels(
             (future_return >= -threshold) & (future_return <= threshold)
         ]
         choices = [1, -1, 0]
-        df[f'Direction_{h}d'] = np.select(conditions, choices, default=0)
+        df[f'Direction_{horizon}d'] = np.select(conditions, choices, default=0)
     else:
         # Binary: up (1), down (0)
         df[f'Direction_{horizon}d'] = (future_return > threshold).astype(int)

@@ -108,7 +108,7 @@ class TestLabelConstruction(unittest.TestCase):
         """Test future return label creation."""
         df = compute_future_returns(self.sample_df.copy(), horizons=[5])
         
-        self.assertIn('Returns_5d', df.columns)
+        self.assertIn('FutureReturn_5d', df.columns)
         self.assertEqual(len(df), len(self.sample_df))
         
     def test_directional_label(self):
@@ -127,7 +127,7 @@ class TestLabelConstruction(unittest.TestCase):
         
         # The label at time t should only depend on prices from t+1 to t+5
         # This is a basic sanity check
-        self.assertFalse(df['Returns_5d'].isna().all(), "All labels are NaN")
+        self.assertFalse(df['FutureReturn_5d'].isna().all(), "All labels are NaN")
 
 
 class TestPipelineIntegration(unittest.TestCase):
@@ -136,13 +136,23 @@ class TestPipelineIntegration(unittest.TestCase):
     def test_basic_pipeline_flow(self):
         """Test that data flows through the pipeline without errors."""
         from market_predictor_ml.pipeline import MarketPredictorPipeline
-        from market_predictor_ml.config.settings import Config, DataConfig
+        from market_predictor_ml.config.settings import (
+            BacktestConfig,
+            Config,
+            DataConfig,
+            ModelConfig,
+        )
         
+        # A 3-month window cannot work here: the indicators use up to 200-day
+        # windows and labels look 21 days ahead, so the matrix would be empty.
+        # Use 4 years plus lightweight model/backtest settings to stay fast.
         config = Config(
             data=DataConfig(
-                default_start_date="2023-01-01",
-                default_end_date="2023-03-31"
-            )
+                default_start_date="2020-01-01",
+                default_end_date="2024-01-01"
+            ),
+            model=ModelConfig(lightgbm_n_estimators=50),
+            backtest=BacktestConfig(n_splits=2, test_size=100),
         )
         
         # Override ticker in data config - need to check how pipeline uses it

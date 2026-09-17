@@ -103,6 +103,33 @@ class AlpacaPaperClient:
         except Exception:
             return 0.0
 
+    def get_position_avg_entry(self, symbol: str) -> float:
+        """Return the average entry price of an open position (0 when flat)."""
+        if self.dry_run or self._trading is None:
+            return 0.0
+        try:
+            pos = self._trading.get_open_position(symbol)
+            return float(pos.avg_entry_price)
+        except Exception:
+            return 0.0
+
+    def get_clock(self) -> Optional[Dict[str, Any]]:
+        """Return the market clock (``is_open``/``next_open``/``next_close``).
+
+        Returns None when unavailable (dry-run or API error).
+        """
+        if self.dry_run or self._trading is None:
+            return None
+        try:
+            clock = self._trading.get_clock()
+            return {
+                "is_open": bool(clock.is_open),
+                "next_open": str(clock.next_open),
+                "next_close": str(clock.next_close),
+            }
+        except Exception:
+            return None
+
     def get_latest_price(self, symbol: str) -> Optional[float]:
         """Return latest quote mid-price, or None when unavailable."""
         if self.dry_run or self._data is None:

@@ -35,6 +35,7 @@ try:
 except Exception:
     pass
 
+import joblib
 import numpy as np
 
 from market_predictor_ml.data import download_stock_data, preprocess_data
@@ -51,12 +52,75 @@ from market_predictor_ml.live.gnn_features import (
 )
 
 LOG_PATH = ROOT / "paper_trades.jsonl"
+STATE_PATH = ROOT / "paper_trader_state.json"
+
+# Fallback when the 21d realised volatility is unavailable (~20% annualised).
+_DAILY_VOL_FALLBACK = 0.0125
+
+
+def _env_float(name: str, default: float) -> float:
+    """Read a float env var, falling back to ``default`` when missing/invalid."""
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        print(f"[WARN] Ignoring invalid {name}={raw!r}; using {default}")
+        return default
 
 
 def _log_event(event: dict) -> None:
     event["ts"] = datetime.now(timezone.utc).isoformat()
     with open(LOG_PATH, "a") as f:
         f.write(json.dumps(event) + "\n")
+
+
+def _model_cache_path(ticker: str, lookback_years: int) -> Path:
+    """Location of the cached model for ``ticker``."""
+    cache_dir = Path(os.getenv("PAPER_TRADING_MODEL_CACHE", str(ROOT / "model_cache")))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / f"{ticker.upper()}_{lookback_years}y.joblib"
+
+
+def _train_or_load_model(ticker: str, lookback_years: int, X: np.ndarray,
+                         y: np.ndarray, feature_cols: list, split: int) -> tuple:
+    """Return ``(model, cache_info)``; retrain at most once per UTC day.
+
+    Training on ~5 years of daily bars takes tens of seconds on a single-board
+    machine, which is wasted work inside a short polling loop. The fitted model
+    is cached per ticker/lookback and reused while it was trained today.
+    """
+    path = _model_cache_path(ticker, lookback_years)
+    today = datetime.now(timezone.utc).date().isoformat()
+    force = os.getenv("PAPER_TRADING_RETRAIN", "false").lower() == "true"
+
+    if not force and path.exists():
+        try:
+            cached = joblib.load(path)
+            if (cached.get("trained_on") == today
+                    and cached.get("feature_cols") == list(feature_cols)):
+                print(f"[model-cache] Reusing {path.name} (trained {today}, "
+                      f"{len(feature_cols)} features)")
+                return cached["model"], {"cached": True, "trained_on": today,
+                                         "path": str(path)}
+        except Exception as exc:
+            print(f"[model-cache] Ignoring unusable cache {path.name}: {exc}")
+
+    model = get_model(
+        "lightgbm", n_estimators=200, learning_rate=0.05, max_depth=5,
+        num_leaves=31, min_child_samples=50, subsample=0.8,
+        colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=0.1,
+        early_stopping_rounds=30,
+    )
+    model.fit(X[:split], y[:split], eval_set=(X[split:], y[split:]))
+    try:
+        joblib.dump({"trained_on": today, "feature_cols": list(feature_cols),
+                     "lookback_years": lookback_years, "model": model}, path)
+        print(f"[model-cache] Trained and cached {path.name}")
+    except Exception as exc:
+        print(f"[model-cache] Could not write {path.name}: {exc}")
+    return model, {"cached": False, "trained_on": today, "path": str(path)}
 
 
 def build_signal(ticker: str, lookback_years: int = 5) -> dict:
@@ -80,22 +144,26 @@ def build_signal(ticker: str, lookback_years: int = 5) -> dict:
         raise RuntimeError(f"Not enough rows ({len(data)}) for {ticker}")
     X = winsorize_features(data[feature_cols].values.astype(float))
     y = data["__label"].values.astype(float)
-    vols = feats.loc[data.index, "Volatility_Realized_21d"].fillna(0.02).values
+    # Volatility_Realized_21d is ANNUALISED (log-return std * sqrt(252)) while
+    # volatility_adjusted_position(target_vol=...) expects a DAILY volatility
+    # (its docstring: "target daily volatility of position"). Sizing with the
+    # annualised figure made every position ~sqrt(252) ~ 16x too small.
+    vols = (feats.loc[data.index, "Volatility_Realized_21d"]
+            .div(np.sqrt(252)).fillna(_DAILY_VOL_FALLBACK).values)
     split = int(len(X) * 0.9)
-    model = get_model(
-        "lightgbm", n_estimators=200, learning_rate=0.05, max_depth=5,
-        num_leaves=31, min_child_samples=50, subsample=0.8,
-        colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=0.1,
-        early_stopping_rounds=30,
+    model, cache_info = _train_or_load_model(
+        ticker, lookback_years, X, y, feature_cols, split
     )
-    model.fit(X[:split], y[:split], eval_set=(X[split:], y[split:]))
     pred = float(model.predict(X[-1:])[0])
-    last_vol = float(vols[-1]) if len(vols) else 0.02
-    max_pos = float(os.getenv("PAPER_TRADING_MAX_POSITION", "1.0"))
+    last_vol = float(vols[-1]) if len(vols) else _DAILY_VOL_FALLBACK
+    max_pos = _env_float("PAPER_TRADING_MAX_POSITION", 1.0)
+    # Target DAILY volatility of the position (2% => ~32% annualised).
+    target_vol = _env_float("PAPER_TRADING_TARGET_VOL", 0.02)
     try:
         base = float(create_positions(
             np.array([pred]), volatility=np.array([max(last_vol, 1e-4)]),
-            method="volatility_adjusted", target_vol=0.02, max_position=max_pos)[0])
+            method="volatility_adjusted", target_vol=target_vol,
+            max_position=max_pos)[0])
     except Exception:
         base = float(create_positions(
             np.array([pred]), method="fixed",
@@ -107,6 +175,7 @@ def build_signal(ticker: str, lookback_years: int = 5) -> dict:
         "final_position": float(np.clip(final, -1.0, 1.0)),
         "n_rows": len(data), "n_features": len(feature_cols),
         "use_rl": rl_enabled(), "use_gnn": gnn_enabled(),
+        "model_cache": cache_info,
     }
 
 
@@ -139,6 +208,106 @@ def _min_order_notional() -> float:
         return 50.0
 
 
+class RiskGuard:
+    """Safety rails for the unattended paper trader.
+
+    - **drawdown halt**: once equity falls ``PAPER_TRADING_MAX_DRAWDOWN``
+      (default 10%) below its peak, no new risk is opened. Risk-reducing
+      orders are always allowed, and the halt clears on a new equity high.
+    - **stop-loss**: a position whose unrealised loss exceeds
+      ``PAPER_TRADING_STOP_LOSS_PCT`` (default 5%) is flattened regardless
+      of what the model says. Set to 0 to disable.
+    - **market hours**: orders are skipped while the market is closed unless
+      ``PAPER_TRADING_IGNORE_MARKET_HOURS=true``.
+
+    Peak equity and the halt flag are persisted to ``paper_trader_state.json``
+    so restarting the process does not silently reset the drawdown guard.
+    """
+
+    def __init__(self, state_path: Path = STATE_PATH) -> None:
+        self.state_path = Path(state_path)
+        self.max_drawdown = _env_float("PAPER_TRADING_MAX_DRAWDOWN", 0.10)
+        self.stop_loss_pct = _env_float("PAPER_TRADING_STOP_LOSS_PCT", 0.05)
+        self.require_open_market = (
+            os.getenv("PAPER_TRADING_IGNORE_MARKET_HOURS", "false").lower() != "true"
+        )
+        self.peak_equity = 0.0
+        self.halted = False
+        self.halt_reason = ""
+        self._load()
+
+    # ------------------------------------------------------------------ state
+    def _load(self) -> None:
+        if not self.state_path.exists():
+            return
+        try:
+            state = json.loads(self.state_path.read_text())
+        except Exception as exc:
+            print(f"[WARN] Could not read {self.state_path.name}: {exc}")
+            return
+        self.peak_equity = float(state.get("peak_equity") or 0.0)
+        self.halted = bool(state.get("halted", False))
+        self.halt_reason = str(state.get("halt_reason") or "")
+
+    def _persist(self) -> None:
+        try:
+            self.state_path.write_text(json.dumps({
+                "peak_equity": self.peak_equity,
+                "halted": self.halted,
+                "halt_reason": self.halt_reason,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }, indent=2))
+        except Exception as exc:
+            print(f"[WARN] Could not write {self.state_path.name}: {exc}")
+
+    # ----------------------------------------------------------------- checks
+    def update_equity(self, equity: float) -> float:
+        """Track peak equity; return the drawdown from that peak."""
+        if equity > self.peak_equity:
+            self.peak_equity = equity
+            if self.halted and self.halt_reason.startswith("max_drawdown"):
+                print(f"[HALT-CLEARED] New equity high ${equity:,.2f}")
+                self.halted, self.halt_reason = False, ""
+            self._persist()
+        return self.drawdown(equity)
+
+    def drawdown(self, equity: float) -> float:
+        """Current drawdown from peak equity (0 when at/above the peak)."""
+        if self.peak_equity <= 0:
+            return 0.0
+        return max(0.0, (self.peak_equity - equity) / self.peak_equity)
+
+    def check_drawdown(self, equity: float) -> bool:
+        """Return True when new risk must be blocked."""
+        if self.max_drawdown > 0 and self.drawdown(equity) >= self.max_drawdown:
+            if not self.halted:
+                self.halt_reason = f"max_drawdown {self.drawdown(equity):.2%}"
+                print(f"[HALT] {self.halt_reason}; new risk blocked until a new "
+                      "equity high (exits still allowed)")
+            self.halted = True
+            self._persist()
+        return self.halted
+
+    def stop_loss_hit(self, avg_entry: float, price: float, qty: float) -> bool:
+        """True when an open position has lost more than the stop-loss level."""
+        if self.stop_loss_pct <= 0 or qty == 0 or avg_entry <= 0 or price <= 0:
+            return False
+        direction = 1.0 if qty > 0 else -1.0
+        pnl_pct = direction * (price - avg_entry) / avg_entry
+        return pnl_pct <= -self.stop_loss_pct
+
+    def market_ok(self, client) -> tuple[bool, str]:
+        """(allowed, reason) - whether orders may be submitted right now."""
+        if not self.require_open_market:
+            return True, "market hours ignored"
+        clock = client.get_clock()
+        if clock is None:
+            return True, "clock unavailable"
+        if clock["is_open"]:
+            return True, "market open"
+        return False, f"market closed (next open {clock['next_open']})"
+
+
 def reconcile_to_target(client, ticker: str, target_frac: float, price: float,
                         capital: float, min_notional: float | None = None) -> dict:
     """Convert fractional target [-1,1] into share orders vs current pos.
@@ -165,26 +334,66 @@ def reconcile_to_target(client, ticker: str, target_frac: float, price: float,
     return res
 
 
-def run_once(ticker: str) -> dict:
-    """Execute a single paper-trading cycle."""
+def run_once(ticker: str, guard: RiskGuard | None = None) -> dict:
+    """Execute a single paper-trading cycle, subject to the risk guard."""
+    guard = guard or RiskGuard()
     client = AlpacaPaperClient()
     account = client.get_account()
+    equity = float(account.get("equity") or 0.0)
+    drawdown = guard.update_equity(equity) if equity else 0.0
+    halted = guard.check_drawdown(equity) if equity else guard.halted
+
     signal = build_signal(ticker, int(os.getenv("PAPER_TRADING_LOOKBACK_YEARS", "5")))
     live_price = client.get_latest_price(ticker)
     if live_price:
         signal["price"] = live_price
-    order = reconcile_to_target(
-        client, ticker, signal["final_position"], signal["price"],
-        capital=_capital_base(account),
-    )
+    price = float(signal["price"])
+    capital = _capital_base(account)
+    qty = client.get_position_qty(ticker)
+    avg_entry = client.get_position_avg_entry(ticker) or price
+
+    target = float(signal["final_position"])
+    risk = {
+        "risk_halted": halted,
+        "halt_reason": guard.halt_reason if halted else "",
+        "drawdown": round(drawdown, 6),
+        "max_drawdown": guard.max_drawdown,
+        "stop_loss_pct": guard.stop_loss_pct,
+        "stop_loss": False,
+        "avg_entry": avg_entry,
+    }
+
+    # A stop-loss overrides the model: flatten the position.
+    if guard.stop_loss_hit(avg_entry, price, qty):
+        risk["stop_loss"] = True
+        print(f"[STOP-LOSS] {ticker} entry={avg_entry:.2f} px={price:.2f} "
+              f"(limit {guard.stop_loss_pct:.1%}) -> flattening")
+        target = 0.0
+    elif halted:
+        # Drawdown halt: allow risk-reducing moves, block new/increased risk.
+        current_frac = (qty * price / capital) if capital else 0.0
+        if abs(target) > abs(current_frac) + 1e-9:
+            risk["risk_blocked"] = True
+            target = current_frac
+
+    market_ok, market_reason = guard.market_ok(client)
+    if not market_ok:
+        # Log the signal, but do not queue orders against a closed market.
+        risk["market_closed"] = True
+        order = {"action": "skipped", "reason": market_reason, "delta_qty": 0.0,
+                 "current_qty": qty, "target_qty": qty, "capital": capital,
+                 "target_notional": qty * price}
+    else:
+        order = reconcile_to_target(client, ticker, target, price, capital=capital)
+
     event = {**signal, **order, "account": account, "dry_run": not client.live,
-             "rl_available": is_rl_available()}
+             "rl_available": is_rl_available(), "risk": risk, "market": market_reason}
     _log_event(event)
-    print(f"[{event['ts']}] {ticker} px={signal['price']:.2f} "
-          f"pred={signal['prediction']:+.4f} pos={signal['final_position']:+.3f} "
-          f"target=${order['target_notional']:,.2f} "
-          f"-> {order['action']} (dry_run={event['dry_run']}, "
-          f"rl={signal['use_rl']}, gnn={signal['use_gnn']})")
+    print(f"[{event['ts']}] {ticker} px={price:.2f} "
+          f"pred={signal['prediction']:+.4f} pos={target:+.3f} "
+          f"target=${order['target_notional']:,.2f} -> {order['action']} "
+          f"(dd={drawdown:.2%}, halted={halted}, stop={risk['stop_loss']}, "
+          f"market={market_reason})")
     return event
 
 
@@ -226,6 +435,17 @@ def preflight(ticker: str) -> int:
           f"(equity, override with PAPER_TRADING_CAPITAL)")
     print(f"min order notional  : ${_min_order_notional():,.2f} "
           f"(override with PAPER_TRADING_MIN_ORDER_NOTIONAL)")
+    guard = RiskGuard()
+    equity = float(account.get("equity") or 0.0)
+    print(f"max drawdown        : {guard.max_drawdown:.1%} "
+          f"(PAPER_TRADING_MAX_DRAWDOWN)")
+    print(f"stop loss           : {guard.stop_loss_pct:.1%} "
+          f"(PAPER_TRADING_STOP_LOSS_PCT, 0 disables)")
+    print(f"trading halted      : {guard.halted} {guard.halt_reason}".rstrip())
+    print(f"peak equity         : ${guard.peak_equity:,.2f} "
+          f"(current drawdown {guard.drawdown(equity):.2%})")
+    if client.live:
+        print(f"market              : {guard.market_ok(client)[1]}")
     if problems:
         print("-" * 70)
         for p in problems:
@@ -255,12 +475,16 @@ def main() -> None:
     if os.getenv("USE_RL", "false").lower() == "true" and not is_rl_available():
         print("[WARN] USE_RL=true but stable-baselines3/gymnasium are not installed; "
               "the RL residual layer is skipped (see requirements.txt).")
+    guard = RiskGuard()
+    print(f"Risk guard: max_drawdown={guard.max_drawdown:.1%} "
+          f"stop_loss={guard.stop_loss_pct:.1%} "
+          f"require_open_market={guard.require_open_market}")
     if args.once:
-        run_once(args.ticker)
+        run_once(args.ticker, guard)
         return
     while True:
         try:
-            run_once(args.ticker)
+            run_once(args.ticker, guard)
         except KeyboardInterrupt:
             print("\nStopped by user.")
             break

@@ -129,7 +129,6 @@ ehthumbs.db
 Thumbs.db
 
 # Environment variables (secrets - never commit real keys)
-.env
 .env.local
 *.env
 *.env.*
@@ -137,11 +136,12 @@ Thumbs.db
 # Reports and generated outputs
 backtest_report.txt
 paper_trades.jsonl
-paper_trader_state.json
 *.png
 
 # Runtime state, caches and logs
 trading_state.db
+paper_trader_state.json
+model_cache/
 logs/
 data_cache/
 state_backups/

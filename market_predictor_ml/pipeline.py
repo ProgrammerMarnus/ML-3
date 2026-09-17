@@ -181,6 +181,13 @@ class MarketPredictorPipeline:
             df = df.dropna()
             print(f"Dropped {initial_len - len(df)} rows with NaN values")
         
+        if len(df) == 0:
+            raise ValueError(
+                "No rows left after dropping NaN feature/label values. Provide a "
+                "longer date range: the indicators (up to 200-day windows) and "
+                "forward-looking labels need roughly 250+ rows of history."
+            )
+        
         # Extract volatility for position sizing
         vol_col = 'Volatility_Realized_21d'
         if vol_col in df.columns:
@@ -343,6 +350,44 @@ class MarketPredictorPipeline:
         self._print_results()
         
         return self.backtest_results_
+
+    def run(
+        self,
+        ticker: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        model_type: str = 'lightgbm',
+        position_method: Optional[str] = None,
+    ) -> Dict:
+        """
+        Run the whole pipeline end to end.
+
+        Chains load_data -> engineer_features -> create_labels ->
+        prepare_data -> train_model -> run_backtest. This is the single-call
+        entry point the examples use.
+
+        Parameters
+        ----------
+        ticker : str
+            Stock ticker symbol
+        start_date, end_date : str, optional
+            Date range (falls back to the configured defaults)
+        model_type : str
+            Model to train ('lightgbm' or 'ridge')
+        position_method : str, optional
+            Position sizing method passed to the backtest
+
+        Returns
+        -------
+        Dict
+            Backtest results, including 'metrics' and 'equity_curve'
+        """
+        self.load_data(ticker, start_date, end_date)
+        self.engineer_features()
+        self.create_labels()
+        self.prepare_data()
+        self.train_model(model_type=model_type)
+        return self.run_backtest(position_method=position_method)
     
     def _print_results(self):
         """Print backtest results summary."""
