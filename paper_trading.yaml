@@ -1,0 +1,146 @@
+# Paper Trading Configuration
+# Copy this file to paper_trading.yaml and customize for your setup
+
+# General Settings
+general:
+  mode: "paper"  # paper or live
+  symbols:
+    - AAPL
+    - GOOGL
+    - MSFT
+    - AMZN
+    - SPY
+  rebalance_frequency: "daily"  # daily, hourly, minute
+  check_market_hours: true
+  dry_run: false  # If true, log orders but don't execute
+
+# Initial Capital
+portfolio:
+  initial_cash: 100000.0  # Starting cash
+  max_position_pct: 0.25  # Maximum 25% in single position
+  max_total_exposure: 1.0  # Maximum total exposure (1.0 = 100%)
+
+# Risk Management
+risk:
+  max_drawdown_pct: 0.10  # Stop trading if down 10%
+  daily_loss_limit_pct: 0.03  # Stop trading if down 3% today
+  max_var_pct: 0.05  # Maximum Value at Risk
+  concentration_limit: 0.25  # Max % in single asset
+  halt_trading_on_breach: true
+
+# Data Provider
+data:
+  provider: "yfinance"  # yfinance, alpaca, polygon, csv
+  cache_dir: "./data_cache"
+  lookback_days: 60  # Days of historical data for features
+
+# Feature Engineering
+features:
+  pipeline_config:
+    momentum:
+      enabled: true
+      periods: [5, 10, 21]
+    volatility:
+      enabled: true
+      periods: [10, 21]
+    volume:
+      enabled: true
+      periods: [5, 10]
+    technical_indicators:
+      enabled: true
+      rsi_period: 14
+      macd_fast: 12
+      macd_slow: 26
+      macd_signal: 9
+    time_features:
+      enabled: false  # Disable for live trading (no future info)
+
+# Model Configuration
+models:
+  registry_path: "./model_registry"
+  # Map symbols to model IDs
+  symbol_model_mapping:
+    AAPL: "model_aapl_v1"
+    GOOGL: "model_googl_v1"
+    MSFT: "model_msft_v1"
+    AMZN: "model_amzn_v1"
+    SPY: "model_spy_v1"
+  
+  # Or use a single model for all symbols
+  default_model_id: "model_universal_v1"
+  
+  # Prediction thresholds
+  min_confidence: 0.65  # Minimum confidence to trade
+  prediction_threshold: 0.02  # Minimum prediction magnitude (2%)
+
+# Position Sizing
+position_sizing:
+  strategy: "volatility_adjusted"  # fixed_fraction, volatility_adjusted, kelly, signal_strength
+  params:
+    target_volatility: 0.02  # 2% daily volatility target
+    max_position_size: 0.25  # Max 25% per position
+    min_position_size: 0.01  # Min 1% per position
+    kelly_fraction: 0.5  # Use half-Kelly
+
+# Broker Configuration (Paper Trading)
+broker:
+  adapter: "paper"  # paper, alpaca_paper, alpaca_live, ibkr
+  # For Alpaca Paper Trading:
+  # adapter: "alpaca_paper"
+  # api_key: "YOUR_ALPACA_PAPER_KEY"
+  # api_secret: "YOUR_ALPACA_PAPER_SECRET"
+  # base_url: "https://paper-api.alpaca.markets"
+  
+  # For Alpaca Live Trading:
+  # adapter: "alpaca_live"
+  # api_key: "YOUR_ALPACA_LIVE_KEY"
+  # api_secret: "YOUR_ALPACA_LIVE_SECRET"
+  # base_url: "https://api.alpaca.markets"
+  
+  # Default order settings
+  default_order_type: "market"
+  default_time_in_force: "day"
+  
+# State Persistence
+state_store:
+  db_path: "./trading_state.db"
+  auto_save_interval_seconds: 60  # Save state every minute
+  backup_enabled: true
+  backup_dir: "./state_backups"
+
+# Logging & Monitoring
+monitoring:
+  log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  log_file: "./logs/paper_trading.log"
+  json_logging: true
+  
+  # Metrics collection
+  metrics_enabled: true
+  metrics_export_interval: 300  # Export metrics every 5 minutes
+  
+  # Alerting
+  alerts_enabled: true
+  alert_channels:
+    - console
+    # - slack  # Requires webhook URL
+    # - email  # Requires SMTP config
+  
+  # Dashboard
+  dashboard_enabled: true
+  dashboard_export_path: "./dashboard.html"
+  dashboard_refresh_interval: 60  # Seconds
+
+# Schedule (for automated runs)
+schedule:
+  enabled: false  # Set to true for automated daily runs
+  start_time: "09:30"  # Market open
+  end_time: "16:00"  # Market close
+  timezone: "America/New_York"
+
+# Advanced Settings
+advanced:
+  prediction_latency_budget_ms: 100  # Max time for prediction
+  order_retry_attempts: 3
+  order_timeout_seconds: 30
+  rate_limit_delay_ms: 100  # Delay between API calls
+  enable_debug_mode: false

@@ -1,0 +1,91 @@
+# Paper Trading Configuration
+# Market Predictor ML - Paper Trading Mode
+
+# Data Provider Configuration
+data:
+  provider: yfinance  # Options: yfinance, alpaca, polygon, csv
+  cache_dir: ./data_cache
+  lookback_days: 60
+
+# Symbols to Trade
+symbols:
+  - SPY
+  - QQQ
+  - AAPL
+  - MSFT
+  - GOOGL
+
+# Model Configuration
+models:
+  # Map symbols to model IDs in the registry
+  model_ids:
+    SPY: spy_model_v1
+    QQQ: qqq_model_v1
+    AAPL: tech_model_v1
+    MSFT: tech_model_v1
+    GOOGL: tech_model_v1
+  
+  # Prediction thresholds
+  min_confidence: 0.65
+  prediction_threshold: 0.02  # 2% expected move
+
+# Feature Pipeline
+features:
+  pipeline_artifact: ./artifacts/feature_pipeline.pkl
+  transformers:
+    - momentum
+    - volatility
+    - volume
+    - technical_indicators
+
+# Broker Configuration (Paper Trading)
+broker:
+  adapter: paper  # Options: paper, alpaca_paper, ibkr_paper
+  initial_cash: 100000.0
+  commission_per_share: 0.005
+  slippage_bps: 5  # 0.05% slippage simulation
+
+# Position Sizing
+position_sizing:
+  strategy: volatility_adjusted  # Options: fixed_fraction, kelly, volatility_adjusted, risk_parity
+  max_position_pct: 0.25  # Max 25% in any single position
+  target_volatility: 0.15  # 15% annualized volatility target
+  max_total_exposure: 0.95  # Keep 5% cash buffer
+
+# Risk Management
+risk:
+  max_drawdown: 0.15  # Halt trading at 15% drawdown
+  daily_loss_limit: 0.03  # Halt trading at 3% daily loss
+  max_consecutive_losses: 5
+  concentration_limit: 0.30  # Max 30% in single sector
+  check_market_hours: true
+
+# Trading Schedule
+schedule:
+  rebalance_frequency: daily  # Options: minute, hourly, daily, weekly
+  trading_hours:
+    start: "09:35"  # Wait 5 min after open
+    end: "15:55"    # Stop 5 min before close
+  days_of_week: [1, 2, 3, 4, 5]  # Monday-Friday
+
+# State Persistence
+persistence:
+  state_db: ./trading_state.db
+  export_interval_hours: 1
+  cleanup_days: 90
+
+# Monitoring & Logging
+monitoring:
+  log_level: INFO
+  log_file: ./logs/paper_trading.log
+  metrics_export: ./metrics/metrics.json
+  dashboard_refresh_seconds: 60
+  alerts:
+    enabled: true
+    drawdown_threshold: 0.10
+    webhook_url: null  # Optional Slack/webhook URL
+
+# Backtest Reference (for comparison)
+backtest_reference:
+  enabled: true
+  artifact: ./artifacts/backtest_results.json

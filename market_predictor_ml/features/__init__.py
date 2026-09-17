@@ -18,8 +18,19 @@ from .labels import (
     create_regression_target,
     create_all_labels,
 )
+from .pipeline import (
+    MomentumTransformer,
+    VolatilityTransformer,
+    VolumeTransformer,
+    TechnicalIndicatorTransformer,
+    TimeFeatureTransformer,
+    LabelGenerator,
+    FeaturePipeline,
+    create_default_pipeline,
+)
 
 __all__ = [
+    # Functional API
     "compute_momentum_features",
     "compute_volatility_features",
     "compute_volume_features",
@@ -34,4 +45,13 @@ __all__ = [
     "triple_barrier_labeling",
     "create_regression_target",
     "create_all_labels",
+    # Transformer API
+    "MomentumTransformer",
+    "VolatilityTransformer",
+    "VolumeTransformer",
+    "TechnicalIndicatorTransformer",
+    "TimeFeatureTransformer",
+    "LabelGenerator",
+    "FeaturePipeline",
+    "create_default_pipeline",
 ]
