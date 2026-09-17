@@ -115,9 +115,11 @@ class LightGBMWrapper(BaseEstimator, RegressorMixin):
             num_boost_round=self.n_estimators,
             valid_sets=valid_sets,
             valid_names=valid_names,
-            callbacks=[
-                lgb.early_stopping(stopping_rounds=self.early_stopping_rounds),
-            ],
+            callbacks=(
+                [lgb.early_stopping(stopping_rounds=self.early_stopping_rounds)]
+                if eval_set is not None
+                else []
+            ),
         )
         
         self.best_iteration_ = self.model_.best_iteration

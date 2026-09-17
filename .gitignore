@@ -42,11 +42,9 @@ ENV/
 *.log
 *.tmp
 
-# Environment variables
+# Environment variables (secrets - never commit real keys)
 .env
 .env.local
-*.env.*
-.env.*
 
 # Coverage
 .coverage
@@ -65,3 +63,6 @@ Thumbs.db
 
 # Reports and outputs
 backtest_report.txt
+paper_trades.jsonl
+paper_trader_state.json
+*.png
