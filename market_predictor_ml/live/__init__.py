@@ -1,18 +1,38 @@
-"""Live trading module for Market Predictor ML.
+"""Live Trading Module - Event-driven trading engine, OMS, and broker adapters."""
 
-Provides Alpaca trading clients (``AlpacaClient`` for paper/live via
-the PR, ``AlpacaPaperClient`` for paper-only dry-run), optional RL
-policy refinement, optional GNN feature augmentation, plus the
-LiveTrader / PaperTrader orchestrators.
-"""
+from .engine import TradingEngine, TradingState
+from .oms import Order, OrderManager, OrderStatus
+from .signals import SignalGenerator
+from .portfolio import PortfolioManager
+from .risk import LiveRiskMonitor
+from .broker_base import BrokerAdapter
+from .brokers import AlpacaBroker, InteractiveBrokersBroker, PaperBroker
 
-from .alpaca_client import AlpacaClient
-from .paper_client import AlpacaPaperClient, is_alpaca_available
-from .rl_policy import RLPolicy, is_rl_available
-from .gnn_features import GNNFeatureAugmenter, is_gnn_available
-from .trader import LiveTrader, PaperTrader
+# Keep existing imports for backward compatibility
+try:
+    from .alpaca_client import AlpacaClient
+    from .paper_client import AlpacaPaperClient, is_alpaca_available
+    from .rl_policy import RLPolicy, is_rl_available
+    from .gnn_features import GNNFeatureAugmenter, is_gnn_available
+    from .trader import LiveTrader, PaperTrader
+except ImportError:
+    pass
 
 __all__ = [
+    # New architecture components
+    "TradingEngine",
+    "TradingState",
+    "Order",
+    "OrderManager",
+    "OrderStatus",
+    "SignalGenerator",
+    "PortfolioManager",
+    "LiveRiskMonitor",
+    "BrokerAdapter",
+    "AlpacaBroker",
+    "InteractiveBrokersBroker",
+    "PaperBroker",
+    # Legacy compatibility
     "AlpacaClient",
     "AlpacaPaperClient",
     "is_alpaca_available",
