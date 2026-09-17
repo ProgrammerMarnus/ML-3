@@ -1,9 +1,15 @@
-```
 # Python
 __pycache__/
 *.py[cod]
 *$py.class
+*.pyc
+*.o
+*.obj
 *.so
+*.dylib
+*.dll
+*.exe
+*.out
 .Python
 build/
 develop-eggs/
@@ -29,18 +35,33 @@ ENV/
 # IDE
 .vscode/
 .idea/
+*.swp
+*.swo
 
-# Logs
+# Logs and temporary files
 *.log
+*.tmp
 
 # Environment variables
 .env
 .env.local
 *.env.*
+.env.*
 
 # Coverage
 .coverage
-htmlcov/
 .coverage.*
 .coverage.xml
-```
+htmlcov/
+coverage/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.mypy_cache/
+
+# Reports and outputs
+backtest_report.txt

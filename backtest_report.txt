@@ -1,0 +1,25 @@
+============================================================
+MARKET PREDICTOR ML - BACKTEST REPORT
+============================================================
+
+PERFORMANCE METRICS
+----------------------------------------
+Total Return: 25.61%
+Annual Return: 20.34%
+Volatility: 20.53%
+Sharpe Ratio: 0.9907
+Sortino Ratio: 1.0585
+Max Drawdown: 42.91%
+Calmar Ratio: 0.4739
+Win Rate: 61.27%
+Avg Win: 0.49%
+Avg Loss: -0.57%
+Profit Factor: 86.18%
+Turnover: 0.55%
+N Trades: 315
+
+BACKTEST PERIOD
+----------------------------------------
+Start Index: 770
+End Index: 1396
+Trading Days: 315
