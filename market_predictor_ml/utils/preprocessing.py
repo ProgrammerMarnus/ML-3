@@ -91,7 +91,7 @@ def winsorize_features(
     Parameters
     ----------
     X : np.ndarray
-        Feature matrix
+        Feature matrix (can be numpy array or pandas DataFrame)
     lower_percentile : float
         Lower percentile for winsorization
     upper_percentile : float
@@ -102,12 +102,18 @@ def winsorize_features(
     np.ndarray
         Winsorized feature matrix
     """
-    X_winsorized = X.copy()
+    # Convert DataFrame to numpy array if needed
+    if hasattr(X, 'values'):
+        X_array = X.values
+    else:
+        X_array = X
     
-    for i in range(X.shape[1]):
-        lower = np.percentile(X[:, i], lower_percentile)
-        upper = np.percentile(X[:, i], upper_percentile)
-        X_winsorized[:, i] = np.clip(X[:, i], lower, upper)
+    X_winsorized = X_array.copy()
+    
+    for i in range(X_winsorized.shape[1]):
+        lower = np.percentile(X_winsorized[:, i], lower_percentile)
+        upper = np.percentile(X_winsorized[:, i], upper_percentile)
+        X_winsorized[:, i] = np.clip(X_winsorized[:, i], lower, upper)
     
     return X_winsorized
 

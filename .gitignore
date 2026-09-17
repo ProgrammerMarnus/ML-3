@@ -1,9 +1,15 @@
-```
 # Python
 __pycache__/
 *.py[cod]
 *$py.class
+*.pyc
+*.o
+*.obj
 *.so
+*.dylib
+*.dll
+*.exe
+*.out
 .Python
 build/
 develop-eggs/
@@ -20,27 +26,50 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+pip-wheel-metadata/
+share/python-wheels/
+MANIFEST
 
 # Virtual environments
 venv/
-.venv/
+env/
 ENV/
+.venv/
+.env/
 
 # IDE
 .vscode/
 .idea/
+*.swp
+*.swo
 
-# Logs
+# Logs and temporary files
 *.log
-
-# Environment variables
-.env
-.env.local
-*.env.*
+*.tmp
 
 # Coverage
 .coverage
-htmlcov/
 .coverage.*
 .coverage.xml
-```
+htmlcov/
+coverage/
+
+# Pytest / mypy caches
+.pytest_cache/
+.mypy_cache/
+
+# Environment variables (secrets - never commit real keys)
+.env
+.env.local
+*.env
+*.env.*
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Reports and outputs
+backtest_report.txt
+paper_trades.jsonl
+paper_trader_state.json
+*.png

@@ -90,6 +90,13 @@ class BacktestConfig:
     
     # Risk-free rate (annual)
     risk_free_rate: float = 0.02
+    
+    # Additional realistic constraints
+    initial_capital: float = 100000.0
+    commission_rate: float = 0.001  # 0.1% per trade
+    min_trade_size: float = 100.0   # Minimum trade value in dollars
+    max_position_size: float = None  # Optional max position limit
+    allow_shorting: bool = True
 
 
 @dataclass
