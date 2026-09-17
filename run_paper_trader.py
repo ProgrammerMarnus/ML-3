@@ -25,16 +25,25 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from market_predictor_ml.live.predictor import LivePredictor
 from market_predictor_ml.live.engine import TradingEngine
-from market_predictor_ml.live.brokers import PaperBroker, create_broker
+from market_predictor_ml.live.brokers import create_broker
+from market_predictor_ml.live.oms import OrderManager
 from market_predictor_ml.live.portfolio import PortfolioManager
 from market_predictor_ml.live.risk import LiveRiskMonitor
 from market_predictor_ml.live.state_store import StateStore, create_state_store
 from market_predictor_ml.live.signals import SignalGenerator
 from market_predictor_ml.monitoring.logger import setup_structured_logging
 from market_predictor_ml.monitoring.metrics import MetricsCollector
-from market_predictor_ml.monitoring.alerting import AlertManager, AlertRule
+from market_predictor_ml.monitoring.alerting import AlertManager, AlertRule, AlertSeverity
 from market_predictor_ml.data.providers import MarketDataLoader, create_data_provider
-from market_predictor_ml.features.pipeline import FeaturePipeline
+from market_predictor_ml.features.pipeline import (
+    FeaturePipeline,
+    MomentumTransformer,
+    TechnicalIndicatorTransformer,
+    TimeFeatureTransformer,
+    VolatilityTransformer,
+    VolumeTransformer,
+    create_default_pipeline,
+)
 from market_predictor_ml.models.model_registry import InMemoryModelRegistry
 
 
@@ -49,6 +58,8 @@ class PaperTradingSystem:
         self.state_store = None
         self.data_loader = None
         self.feature_pipeline = None
+        self.order_manager = None
+        self.initial_cash = 0.0
         self.model_registry = None
         self.predictor = None
         self.signal_generator = None
@@ -125,24 +136,39 @@ class PaperTradingSystem:
         portfolio_config = self.config.get("portfolio", {})
         initial_cash = portfolio_config.get("initial_cash", 100000.0)
         
+        self.order_manager = OrderManager()
         self.portfolio_manager = PortfolioManager(
-            initial_cash=initial_cash,
-            max_position_pct=portfolio_config.get("max_position_pct", 0.25),
-            max_total_exposure=portfolio_config.get("max_total_exposure", 1.0)
+            order_manager=self.order_manager,
+            max_position_weight=portfolio_config.get("max_position_pct", 0.25),
+            cash_buffer=max(0.0, 1.0 - portfolio_config.get("max_total_exposure", 1.0)),
         )
+        self.portfolio_manager.update_cash(initial_cash)
         logger.info(f"Portfolio manager initialized with ${initial_cash:,.2f}")
         
         risk_config = self.config.get("risk", {})
         self.risk_monitor = LiveRiskMonitor(
-            max_drawdown_pct=risk_config.get("max_drawdown_pct", 0.10),
-            daily_loss_limit_pct=risk_config.get("daily_loss_limit_pct", 0.03),
-            concentration_limit=risk_config.get("concentration_limit", 0.25),
-            halt_trading_on_breach=risk_config.get("halt_trading_on_breach", True)
+            max_drawdown=risk_config.get("max_drawdown_pct", 0.10),
+            daily_loss_limit=risk_config.get("daily_loss_limit_pct", 0.03),
+            max_position_size=risk_config.get("concentration_limit", 0.25),
+            var_limit=risk_config.get("max_var_pct", 0.05),
         )
+        if risk_config.get("halt_trading_on_breach", True) is False:
+            logger.warning(
+                "halt_trading_on_breach=false is not supported: LiveRiskMonitor "
+                "always halts trading on a breach"
+            )
         logger.info("Risk monitor initialized")
         
-        broker_config = self.config.get("broker", {})
+        broker_config = dict(self.config.get("broker", {}))
         adapter_type = broker_config.get("adapter", "paper")
+        broker_config.setdefault("initial_cash", initial_cash)
+        if self.config.get("general", {}).get("dry_run", False):
+            if adapter_type != "paper":
+                logger.warning(
+                    f"dry_run=True: overriding broker adapter '{adapter_type}' with the "
+                    "simulated PaperBroker (no orders reach a real venue)"
+                )
+            adapter_type = "paper"
         
         self.broker = create_broker(adapter_type=adapter_type, config=broker_config)
         logger.info(f"Broker initialized (adapter={adapter_type})")
@@ -158,16 +184,57 @@ class PaperTradingSystem:
         
         self.trading_engine = TradingEngine(
             broker=self.broker,
+            signal_generator=self.signal_generator,
             portfolio_manager=self.portfolio_manager,
             risk_monitor=self.risk_monitor,
-            auto_start=False
+            symbols=symbols,
+            config=self.config,
         )
         logger.info("Trading engine initialized")
         logger.info("All components initialized successfully")
     
     def _create_feature_pipeline(self, config: Dict) -> FeaturePipeline:
-        pipeline = FeaturePipeline()
-        return pipeline
+        """Build a FeaturePipeline from the ``features.pipeline_config`` block.
+
+        Each transformer group can be toggled with its ``enabled`` flag; the
+        time features stay off by default because in live trading the timestamp
+        is known but the label horizon is not.
+        """
+        transformers = []
+
+        momentum = config.get("momentum", {})
+        if momentum.get("enabled", True):
+            transformers.append(MomentumTransformer(
+                periods=momentum.get("periods", [5, 10, 21])
+            ))
+
+        volatility = config.get("volatility", {})
+        if volatility.get("enabled", True):
+            transformers.append(VolatilityTransformer(
+                windows=volatility.get("periods", [10, 21])
+            ))
+
+        volume = config.get("volume", {})
+        if volume.get("enabled", True):
+            transformers.append(VolumeTransformer(
+                windows=volume.get("periods", [5, 10])
+            ))
+
+        technical = config.get("technical_indicators", {})
+        if technical.get("enabled", True):
+            transformers.append(TechnicalIndicatorTransformer(
+                rsi_period=technical.get("rsi_period", 14)
+            ))
+
+        time_features = config.get("time_features", {})
+        if time_features.get("enabled", False):
+            transformers.append(TimeFeatureTransformer())
+
+        if not transformers:
+            logger.warning("No feature transformers enabled; falling back to defaults")
+            transformers = create_default_pipeline().transformers
+
+        return FeaturePipeline(transformers=transformers, name="paper_trading_pipeline")
     
     def _load_previous_state(self):
         try:
@@ -196,11 +263,12 @@ class PaperTradingSystem:
         risk_config = self.config.get("risk", {})
         self.alert_manager.add_rule(AlertRule(
             name="max_drawdown_breach",
-            metric="drawdown_pct",
-            condition=">",
-            threshold=risk_config.get("max_drawdown_pct", 0.10),
-            channels=["console"],
-            cooldown_seconds=300
+            metric_name="drawdown_pct",
+            condition=AlertManager.threshold_condition(
+                risk_config.get("max_drawdown_pct", 0.10), ">"
+            ),
+            severity=AlertSeverity.ERROR,
+            cooldown_minutes=5,
         ))
     
     def _save_current_state(self):
@@ -208,24 +276,32 @@ class PaperTradingSystem:
             if self.portfolio_manager:
                 portfolio_data = self.portfolio_manager.get_summary()
                 self.state_store.save_portfolio_state(
-                    initial_cash=portfolio_data.get("initial_cash", 0),
-                    current_cash=portfolio_data.get("cash", 0),
-                    total_equity=portfolio_data.get("total_equity", 0),
-                    realized_pnl=portfolio_data.get("realized_pnl", 0),
-                    unrealized_pnl=portfolio_data.get("unrealized_pnl", 0)
+                    initial_cash=self.initial_cash,
+                    current_cash=portfolio_data.get("cash", 0.0),
+                    total_equity=portfolio_data.get("portfolio_value", 0.0),
+                    realized_pnl=0.0,
+                    unrealized_pnl=portfolio_data.get("total_unrealized_pnl", 0.0),
                 )
-                positions = self.portfolio_manager.get_all_positions()
+                positions = {
+                    pos.symbol: {
+                        "quantity": pos.quantity,
+                        "avg_cost": pos.avg_cost,
+                        "current_price": pos.current_price,
+                    }
+                    for pos in self.portfolio_manager.get_positions()
+                }
                 self.state_store.save_positions(positions)
             
             if self.risk_monitor:
-                risk_data = self.risk_monitor.get_risk_metrics()
+                risk_status = self.risk_monitor.get_risk_status()
+                halted = bool(risk_status.get("trading_halted", False))
                 self.state_store.save_risk_state(
-                    trading_halted=self.risk_monitor.trading_halted,
-                    halt_reason=self.risk_monitor.halt_reason,
-                    max_drawdown_pct=risk_data.get("max_drawdown_pct", 0),
-                    current_drawdown_pct=risk_data.get("current_drawdown_pct", 0),
-                    daily_pnl=risk_data.get("daily_pnl", 0),
-                    peak_equity=risk_data.get("peak_equity", 0)
+                    trading_halted=halted,
+                    halt_reason="max_drawdown_breach" if halted else "",
+                    max_drawdown_pct=risk_status.get("max_drawdown_limit", 0.0),
+                    current_drawdown_pct=risk_status.get("drawdown", 0.0),
+                    daily_pnl=risk_status.get("daily_return", 0.0),
+                    peak_equity=risk_status.get("peak_value", 0.0),
                 )
             logger.debug("State saved successfully")
         except Exception as e:
@@ -240,16 +316,25 @@ class PaperTradingSystem:
             try:
                 current_time = time.time()
                 
-                if self.risk_monitor.trading_halted:
-                    logger.warning(f"Trading halted: {self.risk_monitor.halt_reason}")
+                risk_status = self.risk_monitor.get_risk_status()
+                if risk_status.get("trading_halted"):
+                    logger.warning(
+                        f"Trading halted: drawdown {risk_status.get('drawdown', 0.0):.2%} "
+                        f">= limit {risk_status.get('max_drawdown_limit', 0.0):.2%}"
+                    )
                     time.sleep(60)
                     continue
                 
-                signals = self.predictor.generate_signals()
-                logger.info(f"Generated {len(signals)} signals")
+                predictions = self.predictor.get_latest_predictions()
+                logger.info(f"Generated {len(predictions)} predictions")
                 
-                if signals:
-                    self.trading_engine.process_signals(signals)
+                for symbol, pred in predictions.items():
+                    price = pred.raw_data.get("close")
+                    if price:
+                        self.trading_engine.on_market_data(
+                            symbol, float(price), datetime.now()
+                        )
+                    self.trading_engine.on_prediction(symbol, pred.prediction)
                 
                 if current_time - last_save_time > auto_save_interval:
                     self._save_current_state()
@@ -272,6 +357,8 @@ class PaperTradingSystem:
         portfolio_config = self.config.get("portfolio", {})
         initial_cash = portfolio_config.get("initial_cash", 100000.0)
         
+        self.initial_cash = initial_cash
+
         if self.session_id is None:
             self.session_id = self.state_store.start_session(initial_cash)
             logger.info(f"New trading session started: ID={self.session_id}")
@@ -279,6 +366,11 @@ class PaperTradingSystem:
         self.running = True
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
+
+        if not self.trading_engine.start():
+            raise RuntimeError(
+                "Trading engine failed to start (check the broker configuration)"
+            )
         
         try:
             self._trading_loop()
@@ -290,15 +382,21 @@ class PaperTradingSystem:
         self.running = False
         self._shutdown_requested = True
         self._save_current_state()
+
+        if self.trading_engine:
+            try:
+                self.trading_engine.stop()
+            except Exception as e:
+                logger.error(f"Error stopping trading engine: {e}")
         
         if self.session_id and self.state_store:
             try:
                 portfolio_data = self.portfolio_manager.get_summary() if self.portfolio_manager else {}
-                total_pnl = portfolio_data.get("realized_pnl", 0) + portfolio_data.get("unrealized_pnl", 0)
+                total_pnl = portfolio_data.get("total_unrealized_pnl", 0.0)
                 total_trades = len(self.state_store.get_trade_log())
                 self.state_store.end_session(
                     session_id=self.session_id,
-                    final_cash=portfolio_data.get("cash", 0),
+                    final_cash=portfolio_data.get("cash", 0.0),
                     total_trades=total_trades,
                     total_pnl=total_pnl
                 )
@@ -336,7 +434,7 @@ def main():
     try:
         config = load_config(args.config)
         if args.dry_run:
-            config["general"]["dry_run"] = True
+            config.setdefault("general", {})["dry_run"] = True
             logger.info("Running in dry-run mode")
         
         system = PaperTradingSystem(config)

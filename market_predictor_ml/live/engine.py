@@ -3,10 +3,10 @@ Trading Engine - Event-driven orchestration layer for live trading.
 """
 
 from typing import Optional, Dict, List, Any, Callable
-from datetime import datetime, time
+from datetime import datetime
 from enum import Enum
 import logging
-import asyncio
+import time
 import threading
 
 from .oms import OrderManager, Order, OrderStatus
@@ -221,7 +221,7 @@ class TradingEngine:
                 self._last_heartbeat = datetime.now()
                 
                 # Small sleep to prevent CPU spinning
-                asyncio.run_coroutine_threadsafe(asyncio.sleep(0.1), asyncio.new_event_loop())
+                time.sleep(0.1)
                 
             except Exception as e:
                 logger.error(f"Event loop error: {e}", exc_info=True)

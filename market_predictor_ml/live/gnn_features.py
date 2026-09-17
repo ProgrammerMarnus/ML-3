@@ -60,7 +60,11 @@ class GNNFeatureAugmenter:
             if len(cols) < 2:
                 return df
             window = df[cols].tail(252).fillna(0.0).values
-            corr = np.corrcoef(window, rowvar=False)
+            # Constant columns make the correlation denominator zero; the
+            # resulting NaNs are handled by nan_to_num below, so silence
+            # numpy's divide/invalid warnings here.
+            with np.errstate(invalid="ignore", divide="ignore"):
+                corr = np.corrcoef(window, rowvar=False)
             corr = np.nan_to_num(corr, nan=0.0)
             adj = (np.abs(corr) > self.corr_threshold).astype(float)
             np.fill_diagonal(adj, 0.0)

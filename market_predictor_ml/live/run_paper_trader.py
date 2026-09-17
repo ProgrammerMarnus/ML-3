@@ -42,9 +42,13 @@ from market_predictor_ml.features import create_all_features, get_feature_column
 from market_predictor_ml.models import get_model
 from market_predictor_ml.decision import create_positions
 from market_predictor_ml.utils import winsorize_features
-from market_predictor_ml.live.paper_client import AlpacaPaperClient
-from market_predictor_ml.live.rl_policy import RLPolicy, rl_enabled
-from market_predictor_ml.live.gnn_features import GNNFeatureAugmenter, gnn_enabled
+from market_predictor_ml.live.paper_client import AlpacaPaperClient, is_alpaca_available
+from market_predictor_ml.live.rl_policy import RLPolicy, is_rl_available, rl_enabled
+from market_predictor_ml.live.gnn_features import (
+    GNNFeatureAugmenter,
+    gnn_enabled,
+    is_gnn_available,
+)
 
 LOG_PATH = ROOT / "paper_trades.jsonl"
 
@@ -106,19 +110,58 @@ def build_signal(ticker: str, lookback_years: int = 5) -> dict:
     }
 
 
-def reconcile_to_target(client, ticker: str, target_frac: float, price: float) -> dict:
-    """Convert fractional target [-1,1] into share orders vs current pos."""
-    notional_per_unit = 10_000.0
-    target_qty = float(target_frac) * notional_per_unit / max(price, 1e-6)
+def _capital_base(account: dict | None) -> float:
+    """Notional backing a full (+/-1.0) position.
+
+    Defaults to live account equity (Alpaca paper starts at $100k) and can
+    be overridden with ``PAPER_TRADING_CAPITAL``. Falls back to $10k when
+    the account equity is unknown (dry-run).
+    """
+    override = os.getenv("PAPER_TRADING_CAPITAL")
+    if override:
+        try:
+            return max(float(override), 0.0)
+        except ValueError:
+            print(f"[WARN] Ignoring invalid PAPER_TRADING_CAPITAL={override!r}")
+    equity = (account or {}).get("equity")
+    try:
+        equity = float(equity)
+    except (TypeError, ValueError):
+        equity = 0.0
+    return equity if equity > 0 else 10_000.0
+
+
+def _min_order_notional() -> float:
+    """Dust threshold: orders smaller than this are skipped."""
+    try:
+        return float(os.getenv("PAPER_TRADING_MIN_ORDER_NOTIONAL", "50"))
+    except ValueError:
+        return 50.0
+
+
+def reconcile_to_target(client, ticker: str, target_frac: float, price: float,
+                        capital: float, min_notional: float | None = None) -> dict:
+    """Convert fractional target [-1,1] into share orders vs current pos.
+
+    ``capital`` is the notional that backs a full (+/-1.0) position, so a
+    target of 0.002 on a $100k account means a $200 target position. Orders
+    below ``min_notional`` (default $50) are treated as dust and skipped.
+    """
+    if min_notional is None:
+        min_notional = _min_order_notional()
+    capital = float(capital)
+    target_qty = float(target_frac) * capital / max(price, 1e-6)
     current_qty = client.get_position_qty(ticker)
     delta = target_qty - current_qty
-    if abs(delta) * price < 50.0:  # ignore dust
+    if abs(delta) * price < min_notional:  # ignore dust
         return {"action": "hold", "delta_qty": 0.0,
-                "current_qty": current_qty, "target_qty": target_qty}
+                "current_qty": current_qty, "target_qty": target_qty,
+                "capital": capital, "target_notional": target_qty * price}
     side = "buy" if delta > 0 else "sell"
-    res = client.submit_market_order(ticker, abs(delta), side)
+    res = client.submit_market_order(ticker, abs(delta), side, price=price)
     res.update({"action": side, "delta_qty": float(delta),
-                "current_qty": current_qty, "target_qty": target_qty})
+                "current_qty": current_qty, "target_qty": target_qty,
+                "capital": capital, "target_notional": target_qty * price})
     return res
 
 
@@ -130,20 +173,75 @@ def run_once(ticker: str) -> dict:
     live_price = client.get_latest_price(ticker)
     if live_price:
         signal["price"] = live_price
-    order = reconcile_to_target(client, ticker, signal["final_position"], signal["price"])
-    event = {**signal, **order, "account": account, "dry_run": not client.live}
+    order = reconcile_to_target(
+        client, ticker, signal["final_position"], signal["price"],
+        capital=_capital_base(account),
+    )
+    event = {**signal, **order, "account": account, "dry_run": not client.live,
+             "rl_available": is_rl_available()}
     _log_event(event)
     print(f"[{event['ts']}] {ticker} px={signal['price']:.2f} "
           f"pred={signal['prediction']:+.4f} pos={signal['final_position']:+.3f} "
+          f"target=${order['target_notional']:,.2f} "
           f"-> {order['action']} (dry_run={event['dry_run']}, "
           f"rl={signal['use_rl']}, gnn={signal['use_gnn']})")
     return event
+
+
+def preflight(ticker: str) -> int:
+    """Validate credentials, connectivity and optional layers without trading."""
+    print("-" * 70)
+    print("PREFLIGHT CHECK (no orders are submitted)")
+    print("-" * 70)
+    problems = []
+    key = os.getenv("APCA_API_KEY_ID")
+    secret = os.getenv("APCA_API_SECRET_KEY")
+    print(f"APCA_API_KEY_ID     : {'set' if key else 'MISSING'}")
+    print(f"APCA_API_SECRET_KEY : {'set' if secret else 'MISSING'}")
+    if not (key and secret):
+        problems.append("Alpaca paper credentials missing (see .env.example)")
+    client = AlpacaPaperClient()
+    print(f"alpaca-py installed : {is_alpaca_available()}")
+    print(f"live trading client : {client.live}")
+    account = {}
+    if client.live:
+        try:
+            account = client.get_account()
+            print(f"account             : {account}")
+            print(f"position {ticker:<9} : {client.get_position_qty(ticker)}")
+            print(f"latest quote {ticker:<6} : {client.get_latest_price(ticker)}")
+        except Exception as exc:  # network / auth failure
+            problems.append(f"Alpaca API call failed: {exc}")
+    else:
+        problems.append("client fell back to dry-run (missing alpaca-py or keys)")
+
+    use_rl = os.getenv("USE_RL", "false")
+    use_gnn = os.getenv("USE_GNN", "false")
+    print(f"USE_RL={use_rl:<5} enabled={str(rl_enabled()):<5} available={is_rl_available()}")
+    if use_rl.lower() == "true" and not is_rl_available():
+        print("  [WARN] USE_RL=true but gymnasium/stable-baselines3 are not "
+              "installed -> RL residual layer is skipped.")
+    print(f"USE_GNN={use_gnn:<4} enabled={str(gnn_enabled()):<5} available={is_gnn_available()}")
+    print(f"capital base        : ${_capital_base(account):,.2f} "
+          f"(equity, override with PAPER_TRADING_CAPITAL)")
+    print(f"min order notional  : ${_min_order_notional():,.2f} "
+          f"(override with PAPER_TRADING_MIN_ORDER_NOTIONAL)")
+    if problems:
+        print("-" * 70)
+        for p in problems:
+            print(f"[PROBLEM] {p}")
+        return 1
+    print("-" * 70)
+    print("result              : OK - ready to paper trade")
+    return 0
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Alpaca paper trader (live loop).")
     parser.add_argument("--ticker", default=os.getenv("TICKER", "AAPL"))
     parser.add_argument("--once", action="store_true")
+    parser.add_argument("--check", action="store_true",
+                        help="Run preflight checks (env, account, data) and exit")
     parser.add_argument("--interval", type=int,
                         default=int(os.getenv("PAPER_TRADING_INTERVAL_SEC", "60")))
     args = parser.parse_args()
@@ -152,6 +250,11 @@ def main() -> None:
     print("=" * 70)
     print(f"Ticker: {args.ticker} | USE_RL={os.getenv('USE_RL')} "
           f"| USE_GNN={os.getenv('USE_GNN')} | Log: {LOG_PATH}")
+    if args.check:
+        raise SystemExit(preflight(args.ticker))
+    if os.getenv("USE_RL", "false").lower() == "true" and not is_rl_available():
+        print("[WARN] USE_RL=true but stable-baselines3/gymnasium are not installed; "
+              "the RL residual layer is skipped (see requirements.txt).")
     if args.once:
         run_once(args.ticker)
         return

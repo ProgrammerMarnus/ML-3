@@ -116,30 +116,62 @@ class AlpacaPaperClient:
             return None
 
     def submit_market_order(
-        self, symbol: str, qty: float, side: str
+        self, symbol: str, qty: float, side: str, price: Optional[float] = None
     ) -> Dict[str, Any]:
         """Submit a market order (or log it in dry-run mode).
 
         Parameters
         ----------
         symbol: ticker, e.g. ``"AAPL"``.
-        qty: positive share quantity.
+        qty: positive share quantity (fractional allowed).
         side: ``"buy"`` or ``"sell"``.
+        price: reference price. When given and ``qty`` is fractional the
+            order is sent as a notional (dollar) order, which is what
+            Alpaca expects for fractional market orders.
+
+        Falls back to a whole-share order if the broker rejects the
+        fractional/notional request.
         """
         qty = abs(float(qty))
         if qty <= 0:
             return {"status": "skipped", "reason": "qty<=0"}
+        fractional = abs(qty - round(qty)) > 1e-6
+        use_notional = bool(price) and fractional and qty * float(price) > 0
         if self.dry_run or self._trading is None:
-            print(f"[DRY-RUN] {side.upper()} {qty:.4f} {symbol} @ market")
+            kind = f"notional=${qty * float(price):,.2f}" if use_notional else f"qty={qty:.4f}"
+            print(f"[DRY-RUN] {side.upper()} {kind} {symbol} @ market")
             return {"status": "dry_run", "symbol": symbol, "qty": qty, "side": side}
         order_side = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
-        req = MarketOrderRequest(
-            symbol=symbol,
-            qty=qty,
-            side=order_side,
-            time_in_force=TimeInForce.DAY,
-        )
-        order = self._trading.submit_order(req)
+        if use_notional:
+            req = MarketOrderRequest(
+                symbol=symbol,
+                notional=round(qty * float(price), 2),
+                side=order_side,
+                time_in_force=TimeInForce.DAY,
+            )
+        else:
+            req = MarketOrderRequest(
+                symbol=symbol,
+                qty=round(qty, 4),
+                side=order_side,
+                time_in_force=TimeInForce.DAY,
+            )
+        try:
+            order = self._trading.submit_order(req)
+        except Exception as exc:
+            whole = int(qty)  # floor to whole shares
+            if not fractional or whole < 1:
+                return {"status": "rejected", "symbol": symbol, "qty": qty,
+                        "side": side, "reason": str(exc)}
+            print(f"[WARN] Fractional order rejected ({exc}); retrying with "
+                  f"{whole} whole share(s)")
+            fallback = MarketOrderRequest(
+                symbol=symbol,
+                qty=whole,
+                side=order_side,
+                time_in_force=TimeInForce.DAY,
+            )
+            order = self._trading.submit_order(fallback)
         return {
             "status": "submitted",
             "symbol": symbol,

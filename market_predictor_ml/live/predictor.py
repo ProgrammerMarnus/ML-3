@@ -168,21 +168,22 @@ class LivePredictor:
             
             logger.info(f"Fetching data for {symbol} from {start_date.date()} to {end_date.date()}")
             
-            df = self.data_loader.load_data(
-                symbol=symbol,
-                start_date=start_date,
-                end_date=end_date,
+            df = self.data_loader.load(
+                ticker=symbol,
+                start_date=start_date.date().isoformat(),
+                end_date=end_date.date().isoformat(),
                 interval='1d'
             )
-            
+
             if df is None or len(df) == 0:
                 logger.warning(f"No data returned for {symbol}")
                 return None
-            
-            # Validate data quality
-            if df['close'].isnull().any():
+
+            # Validate data quality. OHLCV column names are capitalised
+            # throughout the data and feature layers.
+            if df['Close'].isnull().any():
                 logger.warning(f"Missing close prices for {symbol}, forward filling")
-                df['close'] = df['close'].ffill()
+                df['Close'] = df['Close'].ffill()
             
             # Update cache
             self._data_cache[symbol] = df
@@ -208,15 +209,17 @@ class LivePredictor:
         """
         try:
             # Ensure required columns exist
-            required_cols = ['open', 'high', 'low', 'close', 'volume']
+            required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
             missing_cols = [col for col in required_cols if col not in df.columns]
             if missing_cols:
                 logger.error(f"Missing required columns for {symbol}: {missing_cols}")
                 return None
             
-            # Apply feature pipeline
+            # Apply feature pipeline.
+            # fit_transform is used because the transformers are stateless and
+            # the pipeline may not have been fitted in this process yet.
             # Note: We transform all data but only use the last row for prediction
-            df_with_features = self.feature_pipeline.transform(df)
+            df_with_features = self.feature_pipeline.fit_transform(df)
             
             if df_with_features is None or len(df_with_features) == 0:
                 logger.warning(f"Feature transformation returned empty result for {symbol}")
@@ -257,7 +260,14 @@ class LivePredictor:
         """
         try:
             # Get model from registry
-            model_wrapper = self.model_registry.get_model(model_id)
+            try:
+                model_wrapper = self.model_registry.get_model(model_id)
+            except KeyError:
+                logger.warning(
+                    f"Model '{model_id}' is not registered for {symbol}; "
+                    "skipping prediction (train and register a model first)"
+                )
+                return None
             if model_wrapper is None:
                 logger.error(f"Model {model_id} not found in registry")
                 return None
@@ -270,7 +280,7 @@ class LivePredictor:
             feature_dict = latest_row.to_dict('records')[0]
             
             # Extract feature array (exclude non-feature columns)
-            exclude_cols = ['open', 'high', 'low', 'close', 'volume', 'datetime', 'date', 'symbol']
+            exclude_cols = ['Open', 'High', 'Low', 'Close', 'Volume', 'datetime', 'date', 'symbol']
             feature_names = [k for k in feature_dict.keys() if k not in exclude_cols]
             X = latest_row[feature_names].values
             
@@ -297,8 +307,8 @@ class LivePredictor:
                 confidence=confidence,
                 features={k: float(v) for k, v in feature_dict.items() if k not in exclude_cols},
                 raw_data={
-                    'close': float(features_df['close'].iloc[-1]),
-                    'volume': float(features_df['volume'].iloc[-1]),
+                    'close': float(features_df['Close'].iloc[-1]),
+                    'volume': float(features_df['Volume'].iloc[-1]),
                 },
                 model_version=model_id,
                 latency_ms=latency_ms

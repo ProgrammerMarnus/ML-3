@@ -2152,7 +2152,55 @@ The strongest version is:
 
 
 ====================================================================
-44. DISCLAIMER
+44. PAPER TRADING (HOW TO RUN IT)
+====================================================================
+
+Two paper-trading entry points are provided.
+
+1. Alpaca paper trader (recommended - trades through your Alpaca paper account)
+
+    cp .env.example .env       # fill in your Alpaca PAPER keys
+    pip install -r requirements.txt
+
+    python market_predictor_ml/live/run_paper_trader.py --check   # preflight, no orders
+    python market_predictor_ml/live/run_paper_trader.py --once    # one cycle
+    python market_predictor_ml/live/run_paper_trader.py           # continuous loop
+
+Each cycle downloads recent history, trains a LightGBM model on risk-adjusted
+returns, sizes the position, and reconciles the Alpaca paper position to that
+target. Every cycle is appended to paper_trades.jsonl as JSON.
+
+Live dashboard:
+
+    streamlit run market_predictor_ml/dashboard/paper_monitor.py
+
+Position sizing: a target of +1.0 means 100% of account equity. Override the
+capital base with PAPER_TRADING_CAPITAL and the dust threshold with
+PAPER_TRADING_MIN_ORDER_NOTIONAL (default $50). Fractional orders are sent as
+notional (dollar) orders, which is what Alpaca expects for fractional shares.
+
+Optional layers, gated by .env flags:
+    USE_GNN=true   cross-asset graph-diffused features (needs torch)
+    USE_RL=true    RL residual position policy (needs gymnasium +
+                   stable-baselines3). Without them the trader prints a warning
+                   and uses the supervised signal unchanged.
+
+2. Engine harness (event-driven engine + OMS + simulated paper broker)
+
+    python run_paper_trader.py --config paper_trading.yaml --dry-run
+
+--dry-run forces the simulated paper broker, so no orders reach a real venue.
+This harness needs trained models registered under model_registry/ for the
+configured model IDs (e.g. model_aapl_v1); until then it runs the loop and logs
+that predictions are skipped. Use lookback_days >= 260 so long-window
+indicators such as the 200-day moving average have enough history.
+
+Never commit real keys: .env is git-ignored, .env.example documents the
+expected variables.
+
+
+====================================================================
+45. DISCLAIMER
 ====================================================================
 
 This is a research and engineering framework, not financial advice.
