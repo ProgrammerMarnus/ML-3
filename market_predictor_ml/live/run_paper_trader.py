@@ -42,7 +42,7 @@ from market_predictor_ml.features import create_all_features, get_feature_column
 from market_predictor_ml.models import get_model
 from market_predictor_ml.decision import create_positions
 from market_predictor_ml.utils import winsorize_features
-from market_predictor_ml.live.alpaca_client import AlpacaPaperClient
+from market_predictor_ml.live.paper_client import AlpacaPaperClient
 from market_predictor_ml.live.rl_policy import RLPolicy, rl_enabled
 from market_predictor_ml.live.gnn_features import GNNFeatureAugmenter, gnn_enabled
 
