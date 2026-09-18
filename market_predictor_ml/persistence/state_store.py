@@ -8,12 +8,18 @@ Provides lightweight state storage for:
 - Signal history
 
 Uses SQLite for durability and JSON for simple serialization.
+
+NOTE (M-9): this SQLite state store is presently UNUSED at runtime. The
+persistence path used by run_paper_trader.py is market_predictor_ml/
+live/state_store.py, which defines its own schema. Keep this module as the
+reference implementation, but reconcile the two schemas before depending on
+both (they are not currently compatible).
 """
 
 import json
 import logging
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -444,11 +450,11 @@ class StateStore:
         query = '''
             SELECT timestamp, cash, total_value, unrealized_pnl, realized_pnl
             FROM portfolio_states
-            WHERE timestamp >= datetime('now', '-{} days')
+            WHERE timestamp >= datetime('now', ?)
             ORDER BY timestamp ASC
-        '''.format(days)
+        '''
         
-        df = pd.read_sql_query(query, conn)
+        df = pd.read_sql_query(query, conn, params=(f"-{int(days)} days",))
         conn.close()
         
         if not df.empty:
@@ -466,8 +472,8 @@ class StateStore:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        cutoff_date = (datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - 
-                      pd.Timedelta(days=days_to_keep)).isoformat()
+        cutoff_date = (datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+                       - timedelta(days=days_to_keep)).isoformat()
         
         tables = ['portfolio_states', 'risk_states', 'engine_states']
         for table in tables:

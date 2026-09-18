@@ -1,0 +1,956 @@
+=====================================================================
+DETAILED AUDIT + FIX/IMPLEMENTATION PLAN
+Project: market_predictor_ml
+Scope: architecture, performance, logic, accuracy
+=====================================================================
+
+NOTE ON THE PACKED SOURCE (repomix-output.xml)
+-----------------------------------------------
+The Repomix export strips dunder names (__init__ -> init, __name__ -> name, __file__ -> file), adds stray spaces (all = for __all__ =), and occasionally splits tokens (pr ed, .iso format(), "pending "). Those are rendering artifacts, not confirmed bugs. I flag them once at the end as "verify in source," but everything below is a logic/math/architecture issue that is unambiguous in the clean code.
+
+SEVERITY KEY
+  [C] Critical - silently wrong numbers or crashes on the normal path
+  [H] High     - broken/dead features, wrong math
+  [M] Medium   - design, thread-safety, performance
+  [L] Low/Nit
+
+
+=====================================================================
+SECTION 1 - CRITICAL FIXES (wrong results / crashes in normal use)
+=====================================================================
+
+---------------------------------------------------------------------
+[C-1] Alert factory rules crash on construction
+File: monitoring/alerting.py
+Funcs: create_sharpe_ratio_alert, create_drawdown_alert,
+       create_prediction_error_alert, create_volume_spike_alert,
+       AlertManager.threshold_condition
+---------------------------------------------------------------------
+PROBLEM
+  The factories pass operators WITH spaces:
+      condition=AlertManager.threshold_condition(min_sharpe, " < ")
+  but threshold_condition looks them up in a dict keyed WITHOUT spaces:
+      operators = {">": ..., "<": ..., ...}
+      if operator not in operators: raise ValueError(...)
+  So every pre-built alert raises ValueError the instant it is created.
+  Second bug: AlertRule.check_and_trigger formats the message with
+      threshold=getattr(self, 'threshold', None)
+  but AlertRule has no threshold attribute, so messages print "None".
+
+WHY IT MATTERS
+  The whole alerting subsystem is unusable; drawdown/Sharpe alerts never work.
+
+FIX
+  1) Normalize the operator.
+  2) Give AlertRule a threshold field so the template renders correctly.
+
+  @dataclass
+  class AlertRule:
+      name: str
+      metric_name: str
+      condition: Callable[[float], bool]
+      severity: AlertSeverity = AlertSeverity.WARNING
+      cooldown_minutes: int = 60
+      message_template: str = "{metric_name} triggered alert: {value}"
+      enabled: bool = True
+      last_triggered: Optional[datetime] = None
+      threshold: Optional[float] = None          # <-- ADD THIS
+
+      def check_and_trigger(self, value, context=None):
+          if not self.enabled:
+              return None
+          if self.last_triggered:
+              cooldown_end = self.last_triggered + timedelta(minutes=self.cooldown_minutes)
+              if datetime.now() < cooldown_end:
+                  return None
+          if self.condition(value):
+              self.last_triggered = datetime.now()
+              message = self.message_template.format(
+                  metric_name=self.metric_name,
+                  value=value,
+                  threshold=self.threshold,        # <-- now real
+              )
+              return Alert(name=self.name, message=message,
+                           severity=self.severity, context=context or {})
+          return None
+
+  @staticmethod
+  def threshold_condition(threshold: float, operator: str = ">"):
+      operator = operator.strip()                # <-- FIX: strip spaces
+      operators = {
+          ">":  lambda x: x > threshold,
+          "<":  lambda x: x < threshold,
+          ">=": lambda x: x >= threshold,
+          "<=": lambda x: x <= threshold,
+          "==": lambda x: x == threshold,
+          "!=": lambda x: x != threshold,
+      }
+      if operator not in operators:
+          raise ValueError(f"Invalid operator: {operator!r}")
+      return operators[operator]
+
+  Then in each factory set threshold, e.g.:
+      return AlertRule(
+          name="low_sharpe_ratio",
+          metric_name="sharpe_ratio",
+          condition=AlertManager.threshold_condition(min_sharpe, "<"),  # no spaces
+          severity=AlertSeverity.WARNING,
+          message_template="Sharpe ratio dropped to {value} (below {threshold})",
+          cooldown_minutes=1440,
+          threshold=min_sharpe,                  # <-- ADD THIS
+      )
+
+---------------------------------------------------------------------
+[C-2] create_data_provider broken for CSV + undefined logger
+File: data/providers.py
+Func: create_data_provider
+---------------------------------------------------------------------
+PROBLEM
+  elif provider_type == "csv":
+      return CSVDataProvider(base_path=config.get("base_path", "./data"))
+  - CSVDataProvider.__init__(self, data_dir) -> base_path= raises TypeError.
+  else:
+      logger.warning(...)                        # logger never defined -> NameError
+
+FIX
+  import logging
+  logger = logging.getLogger(__name__)           # add at module top
+
+  def create_data_provider(provider_type="yfinance", config=None):
+      config = config or {}
+      if provider_type == "yfinance":
+          return YFinanceDataProvider()
+      elif provider_type == "csv":
+          return CSVDataProvider(data_dir=config.get("data_dir", "./data"))  # FIX kwarg
+      else:
+          logger.warning("Unknown provider %s, defaulting to yfinance", provider_type)
+          return YFinanceDataProvider()
+
+---------------------------------------------------------------------
+[C-3] create_live_predictor imports a class that does not exist
+File: live/predictor.py
+Func: create_live_predictor
+---------------------------------------------------------------------
+PROBLEM
+  from ..config.enhanced_settings import EnhancedSettings
+  There is no EnhancedSettings in enhanced_settings.py (it exposes Config /
+  load_config). Any code path hitting this import fails. It is also unused.
+  Additionally, when feature_pipeline/model_registry are None it builds an
+  empty FeaturePipeline([]) and empty InMemoryModelRegistry() and returns an
+  object that "looks" ready but can never produce a signal.
+
+FIX
+  - Delete the bogus import line entirely.
+  - Either require the pipeline/registry or fail loudly:
+
+  def create_live_predictor(config, data_loader=None,
+                            feature_pipeline=None, model_registry=None):
+      from ..data.providers import create_data_provider
+      if data_loader is None:
+          data_loader = create_data_provider(config.get("data_provider", "yfinance"))
+      if feature_pipeline is None:
+          raise ValueError("feature_pipeline must be provided (load from artifact)")
+      if model_registry is None:
+          raise ValueError("model_registry must be provided (load trained models)")
+      ...
+
+---------------------------------------------------------------------
+[C-4] Paper-trading restart does not restore positions/cash
+File: run_paper_trader.py (root)
+Func: PaperTradingSystem._load_previous_state
+---------------------------------------------------------------------
+PROBLEM
+  It reads positions and logs "Loaded N previous positions" but never applies
+  them to portfolio_manager/broker, and never restores cash/equity. On restart
+  the whole persistence layer is defeated - you start flat with fresh cash.
+
+FIX
+  Apply the loaded state into the portfolio manager:
+
+  def _load_previous_state(self):
+      try:
+          portfolio_state = self.state_store.load_portfolio_state()
+          positions = self.state_store.load_positions()
+
+          # Restore cash first (must exist before positions for weights)
+          if portfolio_state:
+              cash = float(portfolio_state.get("current_cash", 0.0))
+              self.portfolio_manager.update_cash(cash)
+              self.initial_cash = float(portfolio_state.get("initial_cash", cash))
+              logger.info(f"Restored cash=${cash:,.2f}")
+
+          # Restore positions
+          for symbol, pos in positions.items():
+              qty = float(pos.get("quantity", 0.0))
+              avg_cost = float(pos.get("avg_cost", 0.0))
+              price = float(pos.get("current_price", avg_cost))
+              if price > 0:
+                  self.portfolio_manager.update_price(symbol, price)
+              if qty != 0.0:
+                  self.portfolio_manager.update_position(symbol, qty, avg_cost)
+          logger.info(f"Restored {len(positions)} positions")
+
+          risk_state = self.state_store.load_risk_state()
+          if risk_state and risk_state.get("trading_halted"):
+              logger.warning(
+                  f"Previous session halted: {risk_state.get('halt_reason')}")
+          active = self.state_store.get_active_session()
+          if active:
+              self.session_id = active["id"]
+      except Exception as e:
+          logger.error(f"Error loading previous state: {e}")
+
+  NOTE: _initialize_components currently builds portfolio_manager AFTER calling
+  _load_previous_state. Reorder so portfolio_manager exists before restore, or
+  call _load_previous_state() after component creation.
+
+---------------------------------------------------------------------
+[C-5] Hyperopt passes kwargs the sizing functions do not accept
+File: optimization/hyperopt.py
+Func: _run_single_fold (create_positions call)
+---------------------------------------------------------------------
+PROBLEM
+  create_positions(..., volatility_target=..., kelly_fraction=...)
+  but decision/sizing.py::volatility_adjusted_position expects target_vol,
+  and kelly_criterion_position expects fraction. create_positions forwards
+  **kwargs, so both raise TypeError. The fold is caught and returns -inf, so
+  EVERY optimization trial silently "fails" with no visible cause.
+
+FIX (use the real parameter names):
+  positions = create_positions(
+      predictions=y_pred,
+      volatility=volatility,
+      method=position_method,
+      max_position=getattr(config.decision, "fixed_position_size", 0.02) * 50,
+      threshold=getattr(config.decision, "signal_threshold", 0.0),
+      target_vol=getattr(config.decision, "volatility_target", 0.15),   # FIX
+      fraction=getattr(config.decision, "kelly_fraction", 0.5),          # FIX
+  )
+
+---------------------------------------------------------------------
+[C-6] Hyperopt leaks test-set statistics into evaluation
+File: optimization/hyperopt.py
+Func: _run_single_fold
+---------------------------------------------------------------------
+PROBLEM
+  X_test_processed, _, _ = standardize_features(X_test_processed)
+  The test fold is standardized with ITS OWN mean/std, and winsorized with its
+  own percentiles. That is leakage into the evaluation set, so Optuna selects
+  hyperparameters on inflated metrics.
+
+FIX
+  Fit scaler/winsorize on train, then apply those exact parameters to test.
+
+  # ---- TRAIN: fit + transform, capture parameters ----
+  lo = config.features.winsorize_lower
+  hi = config.features.winsorize_upper
+  X_train_arr = X_train.values if hasattr(X_train, "values") else np.array(X_train)
+
+  # winsorize train and remember the clip bounds per column
+  lower_bounds = np.percentile(X_train_arr, lo, axis=0)
+  upper_bounds = np.percentile(X_train_arr, hi, axis=0)
+  X_train_w = np.clip(X_train_arr, lower_bounds, upper_bounds)
+
+  X_train_w, keep_indices = remove_near_zero_variance_features(
+      X_train_w, threshold=config.features.variance_threshold)
+  lower_bounds = lower_bounds[keep_indices]
+  upper_bounds = upper_bounds[keep_indices]
+  feature_names = [X.columns[i] for i in keep_indices]
+
+  X_train_processed, mu, sigma = standardize_features(X_train_w)
+
+  # ---- TEST: apply the SAME bounds / indices / mean / std ----
+  X_test_arr = X_test.values if hasattr(X_test, "values") else np.array(X_test)
+  X_test_w = np.clip(X_test_arr, lower_bounds, upper_bounds)
+  X_test_w = X_test_w[:, keep_indices]
+  sigma_safe = np.where(sigma == 0, 1.0, sigma)
+  X_test_processed = (X_test_w - mu) / sigma_safe
+
+---------------------------------------------------------------------
+[C-7] Enhanced backtest cannot flatten/flip a position; shorts mispriced
+File: backtest/enhanced_engine.py
+Funcs: run, Trade.to_dict
+---------------------------------------------------------------------
+PROBLEM A (can't exit on zero / can't flip sign):
+  Positions are closed ONLY when the signal is missing or NaN:
+      if symbol not in signals.columns or pd.isna(signals.loc[date, symbol]): close
+  The open loop skips zero and skips any symbol already in _positions:
+      if pd.isna(signal) or signal == 0: continue
+      if symbol in self._positions: continue
+  So a signal going 1 -> 0 holds forever, and a signal flipping +1 -> -1 never
+  reverses the position. There is no way to exit or flip except via NaN.
+
+PROBLEM B (return_pct wrong for shorts):
+  Trade.to_dict computes:
+      'return_pct': (exit_price - entry_price) / entry_price
+  regardless of side. For a short, pnl is (entry - exit)*qty, so return_pct has
+  the WRONG SIGN. analyze_trades' per-symbol return_pct stats are corrupted.
+
+FIX
+  In run(), treat both NaN and 0 as "close", and close/reopen when the sign
+  changes:
+
+      for symbol in list(self._positions.keys()):
+          sig = signals.loc[date, symbol] if symbol in signals.columns else np.nan
+          pos = self._positions[symbol]
+          pos_sign = 1 if pos.side == 'long' else -1
+          want_close = (symbol not in signals.columns) or pd.isna(sig) or (sig == 0)
+          flipped = (not want_close) and (np.sign(sig) != pos_sign)
+          if want_close or flipped:
+              pos = self._positions.pop(symbol)
+              ... build Trade, add to self._trades, update capital ...
+              # if flipped, fall through so the open loop re-enters with new sign
+
+  In Trade.to_dict, make return_pct side-aware:
+      if self.exit_price is None:
+          ret = None
+      elif self.side == 'long':
+          ret = (self.exit_price - self.entry_price) / self.entry_price
+      else:
+          ret = (self.entry_price - self.exit_price) / self.entry_price
+      return {..., 'return_pct': ret}
+
+---------------------------------------------------------------------
+[C-8] Dashboard chart config is Python repr, not JSON -> charts break
+File: monitoring/dashboard.py
+Funcs: _render_panel, _prepare_chart_config
+---------------------------------------------------------------------
+PROBLEM
+  html += '<canvas data-config=\'{}\'></canvas>\n'.format(
+      self._prepare_chart_config(panel))
+  This injects str(dict) -> Python repr with single quotes and True/None.
+  The JS does JSON.parse(canvas.getAttribute('data-config')) which fails on
+  Python repr, so no chart renders.
+
+FIX
+  import json, html as html_mod
+  ...
+  config_json = json.dumps(self._prepare_chart_config(panel))
+  html += '<canvas data-config="{}"></canvas>\n'.format(
+      html_mod.escape(config_json, quote=True))
+  (The browser un-escapes &quot; back to " before JSON.parse sees it.)
+
+---------------------------------------------------------------------
+[C-9] Monthly-returns heatmap crashes on integer indices
+File: visualization/dashboard.py
+Func: plot_monthly_returns
+---------------------------------------------------------------------
+PROBLEM
+  returns.resample('M') requires a DatetimeIndex. But BacktestDashboard builds
+  equity_curve with an integer index (indices_data) when the input is a numpy
+  array, so resample raises TypeError and the dashboard dies.
+
+FIX
+  Guard before resampling:
+      if not isinstance(returns.index, pd.DatetimeIndex):
+          ax.text(0.5, 0.5, "Monthly heatmap requires a datetime index",
+                  transform=ax.transAxes, ha='center')
+          return ax
+      monthly = returns.resample('ME').apply(lambda x: (1 + x).prod() - 1)
+  (Use 'ME' on pandas>=2.2; keep 'M' if pinned to older pandas.)
+
+---------------------------------------------------------------------
+[C-10] Dependencies missing from requirements.txt
+Files: requirements.txt, pyproject.toml
+---------------------------------------------------------------------
+PROBLEM
+  - config/enhanced_settings.py imports pydantic, but neither requirements.txt
+    nor pyproject.toml lists pydantic.
+  - optimization/hyperopt.py imports optuna; pyproject lists it but
+    requirements.txt does not.
+  A fresh pip install -r requirements.txt cannot import these modules.
+
+FIX
+  Add to requirements.txt:
+      pydantic>=2.0.0
+      optuna>=3.0.0
+  (If you stay on Pydantic v1, pin pydantic<2 and keep @validator; otherwise
+  migrate @validator -> @field_validator and class Config -> model_config.)
+
+
+=====================================================================
+SECTION 2 - HIGH-SEVERITY FIXES (wrong math / dead features)
+=====================================================================
+
+---------------------------------------------------------------------
+[H-1] Sortino / downside deviation is wrong (3 copies)
+Files: monitoring/metrics.py::calculate_sortino_ratio
+       backtest/enhanced_engine.py::_calculate_metrics
+       risk/metrics.py::calculate_sortino_ratio
+---------------------------------------------------------------------
+PROBLEM
+  All three compute downside risk as std(returns[returns < 0]). Correct
+  downside deviation is sqrt(mean(min(r - target, 0)^2)) over ALL observations
+  (positive returns contribute 0, they are not dropped). Using std of only the
+  negatives re-centers around the subset mean and discards the zeros, biasing
+  the risk estimate. The three modules agree with each other but are all wrong.
+
+FIX (canonical implementation):
+  def calculate_sortino_ratio(returns, risk_free_rate=0.0,
+                              periods_per_year=252, target_return=0.0):
+      returns = pd.Series(returns).dropna()
+      if len(returns) < 2:
+          return 0.0
+      rf_per = risk_free_rate / periods_per_year
+      excess = returns - rf_per
+      downside = np.minimum(excess - target_return, 0.0)      # all obs
+      downside_dev = np.sqrt(np.mean(downside ** 2)) * np.sqrt(periods_per_year)
+      if downside_dev == 0:
+          return 0.0 if excess.mean() <= 0 else float("inf")
+      return (excess.mean() * periods_per_year) / downside_dev
+  Apply the same downside_dev in enhanced_engine._calculate_metrics and
+  risk/metrics.py so all three match.
+
+---------------------------------------------------------------------
+[H-2] Alpha can become NaN/complex for negative cumulative returns
+File: monitoring/metrics.py::calculate_alpha_beta
+---------------------------------------------------------------------
+PROBLEM
+  alpha = annualized_return(excess_strat) - beta*annualized_return(excess_bench)
+  where calculate_annualized_return does (1+r).prod() ** (1/years) - 1. If the
+  cumulative excess return is negative, raising a negative number to a
+  fractional power yields NaN (or complex). Alpha silently becomes NaN.
+
+FIX (use arithmetic annualization, matching enhanced_engine.Benchmark):
+  # after aligning r_strat / r_bench and computing beta
+  rf_daily = risk_free_rate / periods_per_year
+  alpha = ((r_strat.mean() - rf_daily) * periods_per_year) \
+        - beta * ((r_bench.mean() - rf_daily) * periods_per_year)
+  return alpha, beta
+
+---------------------------------------------------------------------
+[H-3] Volatility sizer silently kills all short positions
+File: decision/sizers.py::VolatilityAdjustedPositionSizer.calculate_position
+---------------------------------------------------------------------
+PROBLEM
+  position = base_position * np.clip(signal, -1, 1)
+  position = np.clip(position, self.min_position, self.max_position)
+  With min_position default 0.0, every negative (short) position clips to 0,
+  contradicting the "-1 to 1" contract. Short strategies silently go flat.
+
+FIX
+  Clip symmetrically; only floor at min_position when it is intended:
+      position = base_position * np.clip(signal, -1, 1)
+      position = np.clip(position, -self.max_position, self.max_position)
+      return position
+  (If you truly want long-only, set that at the strategy layer, not by a
+  min_position=0 default that surprises callers.)
+
+---------------------------------------------------------------------
+[H-4] MetricsCollector feeds dollar P&L into return-based ratios
+File: monitoring/metrics.py::MetricsCollector.calculate_recent_metrics
+---------------------------------------------------------------------
+PROBLEM
+  returns_series = pd.Series(list(daily_pnl.values()))   # dollars, not returns
+  then calculate_sharpe_ratio(returns_series). Sharpe/Sortino expect fractional
+  returns; using dollar amounts is meaningless and scales with account size.
+
+FIX
+  Convert daily P&L to returns using the portfolio value at day start:
+      daily_pnl = defaultdict(float)
+      daily_equity = {}                     # capture equity per day
+      for trade in recent_trades:
+          d = trade.get("timestamp", datetime.now()).date()
+          daily_pnl[d] += trade.get("pnl", 0)
+          daily_equity.setdefault(d, trade.get("equity_before", None))
+      dates = sorted(daily_pnl)
+      rets = []
+      for d in dates:
+          base = daily_equity.get(d) or self._portfolio_value or 1.0
+          rets.append(daily_pnl[d] / base)
+      returns_series = pd.Series(rets, index=dates)
+  (Ensure record_trade stores an equity/balance snapshot so the divisor exists.)
+
+---------------------------------------------------------------------
+[H-5] signal_strength_position double-scales when power != 1
+File: decision/sizing.py::signal_strength_position
+---------------------------------------------------------------------
+PROBLEM
+  positions = np.tanh(z) * max_position
+  if power != 1.0:
+      positions = np.sign(positions) * (np.abs(positions) ** power) * max_position
+  positions already contains max_position, so raising to power and
+  multiplying by max_position again yields max_position^(power+1) scaling.
+
+FIX
+  Apply power to the tanh output BEFORE scaling once:
+      raw = np.tanh(z_scores.values)                  # in (-1,1)
+      if power != 1.0:
+          raw = np.sign(raw) * (np.abs(raw) ** power)
+      positions = raw * max_position
+      return positions
+
+---------------------------------------------------------------------
+[H-6] Kelly criterion uses the wrong variance
+File: decision/sizing.py::kelly_criterion_position
+---------------------------------------------------------------------
+PROBLEM
+  kelly_f = predictions / np.var(predictions)
+  Kelly is mu / sigma^2 where sigma^2 is the ASSET'S return variance, not the
+  cross-sectional variance of the prediction vector. Dividing by var(predictions)
+  couples every position size to the whole batch - adding an unrelated asset
+  changes all sizes. It also ignores the win_rate/avg_win/avg_loss params.
+
+FIX
+  Pass per-asset volatility in and use it:
+  def kelly_criterion_position(predictions, volatility, fraction=0.25,
+                               max_position=1.0, **kwargs):
+      vol_safe = np.maximum(np.asarray(volatility), 1e-6)
+      # approximate Kelly for Gaussian returns: f* = mu / sigma^2
+      kelly_f = np.asarray(predictions) / (vol_safe ** 2)
+      positions = np.clip(fraction * kelly_f, -max_position, max_position)
+      return positions
+  Update create_positions to route volatility into the kelly branch.
+
+---------------------------------------------------------------------
+[H-7] _calculate_metrics returns {} when returns sum to zero
+File: backtest/enhanced_engine.py::_calculate_metrics
+---------------------------------------------------------------------
+PROBLEM
+  if len(returns) == 0 or returns.sum() == 0: return {}
+  A break-even strategy (sum 0) is a valid backtest; returning {} blanks the
+  whole report.
+
+FIX
+  if len(returns) < 2:
+      return {}
+  # then guard individual divisions (std==0, max_dd==0) instead of bailing out
+
+---------------------------------------------------------------------
+[H-8] Risk monitor: no volatility escalation + several dead features
+File: live/risk.py
+Funcs: check_volatility, update_positions, check_position_concentration,
+       add_return, var_limit
+---------------------------------------------------------------------
+PROBLEM
+  - check_volatility sets WARNING in BOTH the breach and near-breach branches;
+    there is no CRITICAL/HALT path for volatility (unlike drawdown/daily loss).
+  - update_positions loops and does nothing (no weights computed).
+  - check_position_concentration always returns [].
+  - var_limit is stored but VaR is never computed.
+  - add_return is the only way to fill _returns_history, and nothing in the
+    engine calls it, so check_volatility always returns None (<20 obs).
+
+FIX (implement the stubs and wire returns in):
+  def update_positions(self, positions, portfolio_value, prices):
+      self._positions = {}
+      for symbol, qty in positions.items():
+          px = prices.get(symbol, 0.0)
+          self._positions[symbol] = (qty * px) / portfolio_value \
+              if portfolio_value else 0.0
+
+  def check_position_concentration(self):
+      metrics = []
+      for symbol, weight in self._positions.items():
+          if weight > self.max_position_size:
+              level = RiskLevel.CRITICAL
+          elif weight > self.max_position_size * 0.8:
+              level = RiskLevel.WARNING
+          else:
+              continue
+          m = RiskMetric(name="position_concentration", value=weight,
+                         threshold=self.max_position_size, level=level,
+                         timestamp=datetime.now(), metadata={"symbol": symbol})
+          metrics.append(m); self._alerts.append(m); self._notify_callbacks(m)
+      return metrics
+
+  def check_volatility(self):
+      if len(self._returns_history) < 20:
+          return None
+      daily_vol = statistics.stdev(self._returns_history)
+      ann_vol = daily_vol * (252 ** 0.5)
+      if ann_vol >= self.max_portfolio_volatility:
+          level = RiskLevel.CRITICAL          # FIX: escalate
+      elif ann_vol >= self.max_portfolio_volatility * 0.8:
+          level = RiskLevel.WARNING
+      else:
+          level = RiskLevel.NORMAL
+      ...
+
+  In TradingEngine._process_market_event (or after each fill), feed returns:
+      prev = self._last_portfolio_value
+      if prev:
+          self.risk_monitor.add_return((value - prev) / prev)
+      self._last_portfolio_value = value
+  For VaR, implement IRiskMonitor.calculate_var on the returns history or drop
+  the var_limit parameter to avoid a dead knob.
+
+---------------------------------------------------------------------
+[H-9] TradingSignal.target_quantity semantics are ambiguous (target vs delta)
+Files: live/signals.py::generate_signal, live/portfolio.py::generate_signal_orders
+---------------------------------------------------------------------
+PROBLEM
+  generate_signal computes target_quantity as an absolute desired size, then
+  mutates it into a DELTA when a current position exists. But
+  portfolio.generate_signal_orders treats it as a delta:
+      new_weight = current_weight + (signal.target_quantity*price/value)
+  and uses it directly as the order quantity. Downstream sizing is inconsistent.
+
+FIX
+  Split into two explicit fields and keep them distinct:
+
+  @dataclass
+  class TradingSignal:
+      ...
+      target_quantity: float = 0.0    # ABSOLUTE desired position
+      delta_quantity: float = 0.0     # what to actually trade (signed)
+
+  In generate_signal compute:
+      desired_abs = risk_per_trade / dollar_volatility * abs(strength)
+      delta = desired_abs*sign - current_position   # signed trade needed
+      signal.target_quantity = desired_abs * sign
+      signal.delta_quantity  = delta
+  In portfolio.generate_signal_orders use signal.delta_quantity for the order
+  and signal.target_quantity for the weight check.
+
+---------------------------------------------------------------------
+[H-10] MAE/MFE never computed but reported
+File: backtest/enhanced_engine.py
+Funcs: run, analyze_trades
+---------------------------------------------------------------------
+PROBLEM
+  Trade.mae/mfe always 0.0 (never populated), yet analyze_trades reports
+  avg_mae/avg_mfe. The feature looks functional but is a stub returning zeros.
+
+FIX
+  Track the price path while a position is open and fill MAE/MFE on close:
+  - In run(), keep self._price_history[symbol] = list of closes since entry.
+  - On close:
+        path = np.array(self._price_history[symbol])
+        if pos.side == 'long':
+            trade.mae = (path.min() - pos.entry_price) * pos.quantity
+            trade.mfe = (path.max() - pos.entry_price) * pos.quantity
+        else:
+            trade.mae = (pos.entry_price - path.max()) * pos.quantity
+            trade.mfe = (pos.entry_price - path.min()) * pos.quantity
+  Or, if not implementing, remove avg_mae/avg_mfe from analyze_trades.
+
+
+=====================================================================
+SECTION 3 - MEDIUM (architecture / thread-safety / performance)
+=====================================================================
+
+---------------------------------------------------------------------
+[M-1] Thread-safety holes in live engine + OMS
+Files: live/engine.py::TradingEngine, live/oms.py::OrderManager
+---------------------------------------------------------------------
+PROBLEM
+  _run_event_loop runs in a background thread while on_market_data /
+  on_prediction append to self._market_events / self._signal_events from the
+  caller thread. Plain list append/pop(0) without a lock is a race (lost
+  events, IndexError). OrderManager sets self._lock = None and never locks,
+  but broker callbacks can update orders concurrently.
+
+FIX
+  Use thread-safe queues:
+      import queue
+      self._market_events = queue.Queue()
+      self._signal_events = queue.Queue()
+      # producers:
+      self._market_events.put(event)
+      # consumer loop:
+      try:
+          event = self._market_events.get(timeout=0.1)
+      except queue.Empty:
+          event = None
+  In OrderManager:
+      import threading
+      self._lock = threading.Lock()
+      with self._lock:
+          ... mutate self._orders / self._positions ...
+
+---------------------------------------------------------------------
+[M-2] Busy-wait event loop
+File: live/engine.py::_run_event_loop
+---------------------------------------------------------------------
+PROBLEM
+  while self._running: ... time.sleep(0.1)  -> fixed 100 ms polling burns CPU
+  and adds latency even when idle.
+
+FIX
+  Block on the queue with a timeout (see M-1). The loop then sleeps until an
+  event actually arrives and you can drop the hard-coded sleep.
+
+---------------------------------------------------------------------
+[M-3] Engine/OMS layering violations
+File: live/engine.py
+---------------------------------------------------------------------
+PROBLEM
+  - _process_market_event does isinstance(self.broker, PaperBroker) and calls
+    broker.set_price(...) - the engine knows about a concrete broker.
+  - on_prediction reads self.risk_monitor._current_value (private attribute).
+
+FIX
+  - Add update_price(symbol, price) to BrokerAdapter (default no-op) and call
+    self.broker.update_price(...); PaperBroker overrides it.
+  - Expose a public property on LiveRiskMonitor:
+        @property
+        def current_value(self): return self._current_value
+    and use self.risk_monitor.current_value.
+
+---------------------------------------------------------------------
+[M-4] O(n^2) sentiment feature generation
+File: data/sentiment.py::create_sentiment_features
+---------------------------------------------------------------------
+PROBLEM
+  For EVERY date in the price index it calls fetch_news (materializing the whole
+  list) and then filters by date. For long histories this is very slow.
+
+FIX
+  Fetch/generate news ONCE, sort by timestamp, and walk with two pointers or a
+  cumulative approach:
+      news = sorted(self.fetch_news(ticker, days=total_days),
+                    key=lambda n: n["timestamp"])
+      # build a date -> sentiment series once, then rolling-window it
+      per_day = defaultdict(list)
+      for n in news:
+          pol, _ = self.calculate_sentiment(n["title"])
+          per_day[n["timestamp"].date()].append(pol)
+      sent_series = pd.Series(
+          {d: float(np.mean(v)) for d, v in per_day.items()})
+      sent_series = sent_series.reindex(price_df.index.normalize()).ffill().fillna(0.0)
+      df["sentiment_raw"] = sent_series.values
+      ... then rolling features as before ...
+
+---------------------------------------------------------------------
+[M-5] Non-reproducible seeding in mock news
+File: data/sentiment.py::_get_mock_news
+---------------------------------------------------------------------
+PROBLEM
+  np.random.seed(hash(ticker) % 2**32). Python str hash is salted per process,
+  so results differ each run - bad for tests/reproducibility.
+
+FIX
+  import zlib
+  seed = zlib.crc32(ticker.encode()) & 0xFFFFFFFF
+  np.random.seed(seed)
+
+---------------------------------------------------------------------
+[M-6] Macro GDP period mismatch
+File: data/macro.py::calculate_gdp_growth
+---------------------------------------------------------------------
+PROBLEM
+  gdp_series.pct_change(periods=4) assumes quarterly GDP (4 quarters = 1 year),
+  but the mock series is monthly (freq='M'), so it actually computes 4-MONTH
+  growth. Inconsistent between real and mock data.
+
+FIX
+  Detect frequency and choose periods accordingly:
+      freq = pd.infer_freq(gdp_series.index)
+      periods = 4 if freq and freq.startswith('Q') else 12
+      return gdp_series.pct_change(periods=periods) * 100
+
+---------------------------------------------------------------------
+[M-7] TradingEnv ignores the regime feature + long-only mismatch
+File: rl/environment.py::TradingEnv
+---------------------------------------------------------------------
+PROBLEM
+  - obs builds regime via: regime = row.get("regime",0) if isinstance(row,dict)
+    else 0. But row is a pandas Series, never a dict, so regime is ALWAYS 0 -
+    the regime input the docstring promises is never used.
+  - action_space is Box(0,1) (long-only) but docs/position describe -1..1.
+
+FIX
+  Read regime from the Series:
+      regime = float(row["regime"]) if "regime" in row.index else 0.0
+  And decide the action semantics explicitly; if you want long/short, use
+  Box(-1,1) and map accordingly in step().
+
+---------------------------------------------------------------------
+[M-8] SQL string formatting + pandas in persistence layer
+File: persistence/state_store.py
+Funcs: get_portfolio_history, cleanup_old_states
+---------------------------------------------------------------------
+PROBLEM
+  get_portfolio_history builds "... datetime('now','-{days} days')".format(days)
+  - string-formatted SQL (injection-prone if days is ever user-controlled).
+  cleanup_old_states uses pd.Timedelta inside the persistence layer.
+
+FIX
+  Parameterize:
+      cursor.execute(
+          "SELECT ... FROM portfolio_states WHERE timestamp >= datetime('now', ?)",
+          (f"-{int(days)} days",))
+      df = pd.read_sql_query(query, conn, params=...)
+  For cleanup use datetime - timedelta(days=days_to_keep) instead of pandas.
+
+---------------------------------------------------------------------
+[M-9] Duplicated subsystems (two of everything)
+Files: backtest/engine.py vs backtest/enhanced_engine.py
+       decision/sizing.py vs decision/sizers.py
+       config/settings.py vs config/enhanced_settings.py
+       data/loader.py vs data/providers.py (preprocess_data/compute_returns
+       duplicated verbatim)
+       live/state_store.py vs persistence/state_store.py
+---------------------------------------------------------------------
+PROBLEM
+  Two divergent implementations of the same concern. E.g. volatility sizing
+  exists in sizing.py (clips symmetric) and sizers.py (zeroes shorts). Any fix
+  must be made twice and will drift. Two separate SQLite "trading state"
+  schemas are never reconciled.
+
+FIX
+  Pick one per concern and make the other a thin re-export:
+  - Keep the class-based IPositionSizer hierarchy (matches core interface);
+    delete functional sizing.py or have it delegate to the sizers.
+  - Choose one StateStore schema and migrate the other to it.
+  - Move preprocess_data/compute_returns to a single utils module and import.
+
+---------------------------------------------------------------------
+[M-10] core ABCs are decorative (signatures don't match implementations)
+File: core/__init__.py
+---------------------------------------------------------------------
+PROBLEM
+  IBacktestEngine.run is declared as run(predictions, actuals, positions,
+  prices) but EnhancedBacktestEngine.run(signals, prices, volumes). Nothing
+  enforces the contract; the ABC gives false confidence.
+
+FIX
+  Align the ABC signatures with the real implementations (or define separate
+  interfaces for vectorized vs portfolio engines) and add a test that
+  instantiates each concrete class against its interface.
+
+---------------------------------------------------------------------
+[M-11] Look-ahead / execution-timing in walk-forward backtest
+File: backtest/engine.py::run_walk_forward_backtest
+---------------------------------------------------------------------
+PROBLEM
+  strategy_returns = positions * y_test
+  Positions derived from features at close t are multiplied by the return
+  starting at t. That assumes you can trade at the exact close used to build
+  the features. The README explicitly prescribes position.shift(1) *
+  next_day_return. At minimum this is optimistic and inconsistent with the
+  documented methodology.
+
+FIX (align with README - enter on the next bar):
+  n = len(y_test)
+  strategy_returns = np.zeros(n)
+  if n > 1:
+      strategy_returns[1:] = positions[:-1] * y_test[1:]
+  # then apply costs to strategy_returns
+  If you intend trade-at-close, document that assumption and apply it
+  consistently everywhere (including transaction-cost timing).
+
+---------------------------------------------------------------------
+[M-12] No total-exposure cap; max_portfolio_turnover unused
+File: backtest/enhanced_engine.py::EnhancedBacktestEngine
+---------------------------------------------------------------------
+PROBLEM
+  Each position is sized off capital (max_position_size * abs(signal)), but
+  capital is only reduced by transaction cost, never by entry value, and there
+  is no cap on the SUM of positions. You can open many positions each sized off
+  near-full capital -> >100% gross exposure. max_portfolio_turnover is accepted
+  but never used.
+
+FIX
+  Track gross exposure and enforce limits:
+      gross = sum(abs(p.quantity)*current_prices[p.symbol]
+                  for p in self._positions.values())
+      room = max(0.0, self.max_gross_exposure*capital - gross)
+      target_value = min(capital*self.max_position_size*abs(signal), room)
+      if target_value <= 0: continue
+  Either implement turnover throttling using max_portfolio_turnover or remove
+  the parameter. Rename capital to cash to avoid the "fully funded"
+  confusion, since positions are notional.
+
+
+=====================================================================
+SECTION 4 - LOWER-PRIORITY / CONSISTENCY / NITS
+=====================================================================
+
+[L-1] TransactionCostModel spread: comment says "half spread", code applies
+      full spread (notional * self.spread) on every one-way trade. Decide: use
+      notional*self.spread*0.5 for a single side, or rename the parameter to
+      half_spread. File: backtest/enhanced_engine.py.
+
+[L-2] Annualized-return convention is mixed: enhanced_engine uses arithmetic
+      mean*252 for annual_return, metrics.calculate_annualized_return uses CAGR
+      (geometric), Benchmark.calculate_alpha_beta uses arithmetic. Pick one and
+      document it so Sharpe/Calmar/alpha agree across modules.
+
+[L-3] LabelGenerator (features/pipeline.py) only takes a single threshold and
+      sets pt=threshold, sl=-threshold, ignoring LabelConfig's separate
+      triple_barrier_profit_target / triple_barrier_stop_loss. Pass both.
+
+[L-4] live/predictor.py::get_market_status uses naive datetime.now() and
+      hard-codes 9:30/16:00 assuming US Eastern. On a non-ET host this
+      misclassifies the session. Use zoneinfo.ZoneInfo("America/New_York").
+
+[L-5] metrics.py::get_prediction_accuracy: np.mean([]) warns/NaNs if all
+      actuals are 0 (empty MAPE list). Guard with len>0.
+
+[L-6] BacktestConfig.train_size typed int = None in config/settings.py should
+      be Optional[int]. (enhanced_settings.py already uses Optional[int].)
+
+[L-7] config/enhanced_settings.py::override_from_env only walks one level of
+      nesting, so list fields (momentum_periods, etc.) can't be overridden via
+      env. Extend or document the limitation.
+
+[L-8] Several __init__.py define all = [...] instead of __all__ = [...]
+      (backtest, monitoring, features, risk, live, tests/fixtures). If that is
+      not purely a packing artifact, from pkg import * ignores it. Use
+      __all__.
+
+[L-9] hyperopt._suggest_label_params / _run_single_fold reference config fields
+      (labels.label_method, labels.direction_threshold, decision.fixed_position_size,
+      decision.signal_threshold, decision.volatility_target, decision.kelly_fraction)
+      that do not exist on LabelConfig/DecisionConfig. They are silently ignored
+      via getattr/hasattr -> dead suggested params. Add the fields to the configs
+      or drop them from the search space.
+
+[L-10] hyperopt.run_optimization_example constructs Config(ticker=..., start_date=...,
+       model={"model_type":...}) but the Config dataclass fields are
+       data/features/labels/model/decision/backtest and model expects a
+       ModelConfig. The example raises TypeError as written. Fix the example to
+       build Config(data=DataConfig(...), model=ModelConfig(), ...).
+
+[L-11] KellyPositionSizer.update_history maintains _trade_history but
+       calculate_position never reads it (decision/sizers.py). Use it to estimate
+       win_rate/payoff, or delete it.
+
+[L-12] portfolio.generate_rebalance_orders enforces max_position_weight but not
+       min_position_weight (positions below the min are never closed). Add the
+       check.
+
+[L-13] live/engine.py::TradingEngine.stop() sets _running=False but never joins
+       _loop_thread. Add self._loop_thread.join(timeout=...) for clean shutdown.
+
+
+=====================================================================
+SECTION 5 - VERIFY-IN-SOURCE (likely packing artifacts)
+=====================================================================
+These appear in the packed file and are PROBABLY Repomix dunder/token mangling,
+but confirm against the real source; if real they are hard errors:
+  - def init(self -> should be def __init__(self
+  - if name == "main": -> should be if __name__ == "__main__":
+  - os.path.abspath(file) -> should be __file__ (tests/test_monitoring.py)
+  - all = [...] -> __all__ = [...]
+  - end.iso format() / pr ed = ... in live/run_paper_trader.py (if real,
+    syntax errors: should be end.isoformat() and pred = ...)
+  - Enum values rendered with trailing spaces, e.g. PENDING = "pending "
+
+
+=====================================================================
+SECTION 6 - RECOMMENDED ORDER OF WORK
+=====================================================================
+ 1. [C-1] Alert operator/threshold fix            (unblocks all alerting)
+ 2. [C-2] create_data_provider kwarg + logger      (unblocks CSV path)
+ 3. [C-3] Remove EnhancedSettings import + require pipeline/registry
+ 4. [C-5]+[C-6] Hyperopt kwargs + leakage fix      (optimization currently
+                                                    selects on leaked/failed trials)
+ 5. [C-4] Restore positions/cash on restart        (persistence actually works)
+ 6. [C-7] Enhanced engine close-on-zero/flip + short return_pct
+ 7. [H-1] Fix downside deviation everywhere (3 files)
+ 8. [C-10] Add pydantic + optuna to requirements
+ 9. [H-2] Alpha arithmetic fix
+10. [H-3] Volatility sizer short clipping
+11. [H-9] Split target_quantity vs delta_quantity  (signals + portfolio)
+12. [H-8] Implement risk concentration/volatility escalation + feed returns
+13. [M-1]+[M-2] queue.Queue + locks (thread safety, busy-wait)
+14. [M-9] Consolidate duplicated subsystems
+15. [M-11] Decide and document trade-at-close vs next-bar shift
+16. Remaining [M]/[L] items.
+
+Each fix above is localized and independently testable; the critical path
+(1-9) removes the issues that silently produce wrong numbers or crash on the
+normal execution path.

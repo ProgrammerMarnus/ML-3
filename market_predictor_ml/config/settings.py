@@ -5,7 +5,7 @@ Default parameters for each component of the system.
 """
 
 from dataclasses import dataclass, field
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 
 @dataclass
@@ -40,6 +40,9 @@ class LabelConfig:
     triple_barrier_profit_target: float = 0.05
     triple_barrier_stop_loss: float = 0.03
     risk_adjust_window: int = 21
+    # Referenced by optimization/hyperopt.py (L-9)
+    label_method: str = "future_return"  # future_return | direction | triple_barrier
+    direction_threshold: float = 0.0
 
 
 @dataclass
@@ -73,6 +76,10 @@ class DecisionConfig:
     kelly_fraction: float = 0.25
     signal_strength_power: float = 1.0
     prediction_threshold: float = 0.0
+    # Referenced by optimization/hyperopt.py (L-9)
+    fixed_position_size: float = 0.02
+    signal_threshold: float = 0.0
+    volatility_target: float = 0.15
 
 
 @dataclass
@@ -80,7 +87,7 @@ class BacktestConfig:
     """Configuration for backtesting."""
     n_splits: int = 5
     test_size: int = 252  # ~1 trading year
-    train_size: int = None  # Use all available history
+    train_size: Optional[int] = None  # Use all available history
     purge_size: int = 0
     embargo_size: int = 0
     

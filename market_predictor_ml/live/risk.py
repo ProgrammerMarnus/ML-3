@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass
 from enum import Enum
 import logging
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +98,11 @@ class LiveRiskMonitor:
             except Exception as e:
                 logger.error(f"Risk callback error: {e}")
     
+    @property
+    def current_value(self) -> float:
+        """Current portfolio value (public accessor for other components)."""
+        return self._current_value
+
     def update_portfolio_value(self, value: float):
         """Update current portfolio value."""
         self._current_value = value
@@ -108,19 +114,28 @@ class LiveRiskMonitor:
         # Set daily start if not set
         if self._daily_start_value == 0:
             self._daily_start_value = value
-    
+
     def reset_daily(self):
         """Reset daily metrics (call at market open)."""
         self._daily_start_value = self._current_value
         logger.info("Daily risk metrics reset")
     
-    def update_positions(self, positions: Dict[str, float], portfolio_value: float):
-        """Update position weights."""
+    def update_positions(
+        self,
+        positions: Dict[str, float],
+        portfolio_value: float,
+        prices: Optional[Dict[str, float]] = None,
+    ):
+        """Update position weights (symbol -> fraction of portfolio value)."""
         self._positions = {}
+        if not portfolio_value or portfolio_value <= 0:
+            return
+        prices = prices or {}
         for symbol, qty in positions.items():
-            # Would need prices to calculate weights
-            # Simplified for now
-            pass
+            price = prices.get(symbol, 0.0)
+            if price <= 0:
+                continue
+            self._positions[symbol] = (qty * price) / portfolio_value
     
     def add_return(self, return_pct: float):
         """Add return to history for volatility calculation."""
@@ -157,6 +172,10 @@ class LiveRiskMonitor:
         vol_metric = self.check_volatility()
         if vol_metric and vol_metric.level != RiskLevel.NORMAL:
             breaches.append(vol_metric)
+        # Check VaR
+        var_metric = self.check_var()
+        if var_metric and var_metric.level != RiskLevel.NORMAL:
+            breaches.append(var_metric)
         
         # Update trading halt status
         critical_breaches = [m for m in breaches if m.level == RiskLevel.HALT]
@@ -234,9 +253,31 @@ class LiveRiskMonitor:
         return metric
     
     def check_position_concentration(self) -> List[RiskMetric]:
-        """Check position concentration limits."""
+        """Check position concentration limits (requires update_positions)."""
         metrics = []
-        # Simplified - would need actual position weights
+        for symbol, weight in self._positions.items():
+            if weight > self.max_position_size:
+                level = RiskLevel.CRITICAL
+            elif weight > self.max_position_size * 0.8:
+                level = RiskLevel.WARNING
+            else:
+                continue
+
+            metric = RiskMetric(
+                name="position_concentration",
+                value=weight,
+                threshold=self.max_position_size,
+                level=level,
+                timestamp=datetime.now(),
+                metadata={"symbol": symbol},
+            )
+            metrics.append(metric)
+            self._alerts.append(metric)
+            self._notify_callbacks(metric)
+            logger.warning(
+                f"Position concentration alert: {symbol} at {weight:.2%} "
+                f"(limit: {self.max_position_size:.2%})"
+            )
         return metrics
     
     def check_volatility(self) -> Optional[RiskMetric]:
@@ -249,7 +290,7 @@ class LiveRiskMonitor:
         annualized_vol = daily_vol * (252 ** 0.5)
         
         if annualized_vol >= self.max_portfolio_volatility:
-            level = RiskLevel.WARNING
+            level = RiskLevel.CRITICAL
         elif annualized_vol >= self.max_portfolio_volatility * 0.8:
             level = RiskLevel.WARNING
         else:
@@ -271,6 +312,65 @@ class LiveRiskMonitor:
         
         return metric
     
+    def calculate_var(self, returns=None, confidence: float = 0.95) -> Optional[float]:
+        """
+        Historical Value at Risk as a positive loss fraction of portfolio value.
+
+        Uses the internal returns history when ``returns`` is not provided.
+        """
+        hist = list(returns) if returns is not None else self._returns_history
+        if len(hist) < 2:
+            return None
+        arr = np.asarray(hist, dtype=float)
+        loss = -np.percentile(arr, (1.0 - confidence) * 100.0)
+        return float(max(loss, 0.0))
+
+    def calculate_expected_shortfall(self, returns=None, confidence: float = 0.95) -> Optional[float]:
+        """
+        Historical Expected Shortfall (CVaR) as a positive loss fraction.
+
+        Uses the internal returns history when ``returns`` is not provided.
+        """
+        hist = list(returns) if returns is not None else self._returns_history
+        if len(hist) < 2:
+            return None
+        arr = np.sort(np.asarray(hist, dtype=float))
+        cutoff = max(1, int(round(len(arr) * (1.0 - confidence))))
+        tail = arr[:cutoff]
+        return float(max(-tail.mean(), 0.0))
+
+    def check_var(self) -> Optional[RiskMetric]:
+        """Check Value at Risk against the configured var_limit."""
+        if len(self._returns_history) < 20 or self._current_value <= 0:
+            return None
+
+        var_pct = self.calculate_var(confidence=0.95)
+        if var_pct is None:
+            return None
+
+        if var_pct > self.var_limit:
+            level = RiskLevel.CRITICAL
+        elif var_pct > self.var_limit * 0.8:
+            level = RiskLevel.WARNING
+        else:
+            level = RiskLevel.NORMAL
+
+        metric = RiskMetric(
+            name="value_at_risk",
+            value=var_pct,
+            threshold=self.var_limit,
+            level=level,
+            timestamp=datetime.now(),
+            metadata={"observations": len(self._returns_history), "confidence": 0.95},
+        )
+
+        if level != RiskLevel.NORMAL:
+            self._alerts.append(metric)
+            self._notify_callbacks(metric)
+            logger.warning(f"VaR alert: {var_pct:.2%} (limit: {self.var_limit:.2%})")
+
+        return metric
+
     def is_trading_allowed(self) -> bool:
         """Check if trading is allowed (not halted)."""
         return not self._trading_halted

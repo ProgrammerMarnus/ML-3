@@ -14,8 +14,11 @@ from typing import Optional, List, Dict, Any
 from abc import ABC, abstractmethod
 from pathlib import Path
 import yfinance as yf
+import logging
 
 from ..core import IDataLoader, IDataProvider
+
+logger = logging.getLogger(__name__)
 
 
 class YFinanceDataProvider(IDataProvider):
@@ -301,7 +304,7 @@ def create_data_provider(provider_type: str = "yfinance", config: Optional[Dict]
     if provider_type == "yfinance":
         return YFinanceDataProvider()
     elif provider_type == "csv":
-        return CSVDataProvider(base_path=config.get("base_path", "./data"))
+        return CSVDataProvider(data_dir=config.get("data_dir", "./data"))
     else:
         logger.warning(f"Unknown provider type '{provider_type}', defaulting to yfinance")
         return YFinanceDataProvider()

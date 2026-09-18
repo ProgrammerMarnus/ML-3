@@ -3,14 +3,25 @@ Custom Gymnasium Environment for Trading Simulation.
 Supports discrete and continuous action spaces for RL agents.
 """
 
-import gymnasium as gym
-from gymnasium import spaces
 import numpy as np
 import pandas as pd
 from typing import Dict, Any, Optional, Tuple
 
+# gymnasium is an optional dependency. Importing this module must not fail when
+# it is absent (mirroring the stable_baselines3 guard in agents.py), so the
+# class falls back to `object` and __init__ raises a helpful ImportError.
+try:
+    import gymnasium as gym
+    from gymnasium import spaces
 
-class TradingEnv(gym.Env):
+    GYMNASIUM_AVAILABLE = True
+except ImportError:  # pragma: no cover - exercised only without gymnasium
+    gym = None
+    spaces = None
+    GYMNASIUM_AVAILABLE = False
+
+
+class TradingEnv(gym.Env if GYMNASIUM_AVAILABLE else object):
     """
     Trading environment for reinforcement learning.
     
@@ -31,6 +42,10 @@ class TradingEnv(gym.Env):
         reward_type: str = "sharpe",
         render_mode: Optional[str] = None,
     ):
+        if not GYMNASIUM_AVAILABLE:
+            raise ImportError(
+                "TradingEnv requires gymnasium. Install it with: pip install gymnasium"
+            )
         super().__init__()
         
         self.df = df.reset_index(drop=True)
@@ -70,7 +85,12 @@ class TradingEnv(gym.Env):
         position_norm = self.position
         
         # Regime indicator (default 0 if not present)
-        regime = row.get("regime", 0) if isinstance(row, dict) else 0
+        if isinstance(row, dict):
+            regime = float(row.get("regime", 0.0))
+        elif hasattr(row, "index") and "regime" in row.index:
+            regime = float(row["regime"])
+        else:
+            regime = 0.0
         
         obs = np.concatenate([[balance_norm, position_norm], features, [regime]])
         return obs.astype(np.float32)

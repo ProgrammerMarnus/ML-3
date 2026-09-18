@@ -150,6 +150,14 @@ class BrokerAdapter(ABC):
         """Stop streaming quotes."""
         pass
     
+    def update_price(self, symbol: str, price: float) -> None:
+        """Receive a latest market price (default: no-op).
+
+        The live engine forwards every market event here so brokers that
+        need price state (e.g. paper-trading fill simulation) can track it.
+        Brokers without an internal price book can ignore this."""
+        return None
+
     def validate_order(self, order: Order) -> tuple[bool, str]:
         """
         Validate order before submission.

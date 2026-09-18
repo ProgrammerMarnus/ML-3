@@ -72,6 +72,10 @@ class PaperBroker(BrokerAdapter):
         """Get available cash."""
         return self._cash_balance
     
+    def update_price(self, symbol: str, price: float) -> None:
+        """BrokerAdapter hook: track latest price for paper fills."""
+        self.set_price(symbol, price)
+
     def set_price(self, symbol: str, price: float):
         """Set current market price (for simulation)."""
         self._prices[symbol] = price

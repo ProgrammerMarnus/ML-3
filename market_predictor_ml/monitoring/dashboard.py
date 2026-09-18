@@ -6,6 +6,7 @@ Generates HTML reports with charts and key performance indicators.
 """
 
 import json
+import html as html_mod
 from datetime import datetime
 from typing import Dict, Any, Optional, List, Tuple
 from dataclasses import dataclass, field
@@ -458,8 +459,18 @@ class Dashboard:
         
         elif panel.panel_type == "chart":
             html += '<div class="chart-container">\n'
-            html += '<canvas data-config=\'{}\'></canvas>\n'.format(
-                self._prepare_chart_config(panel)
+            config = self._prepare_chart_config(panel)
+
+            def _json_default(obj):
+                if isinstance(obj, pd.Timestamp):
+                    return obj.isoformat()
+                if isinstance(obj, np.generic):
+                    return obj.item()
+                raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+            config_json = json.dumps(config, default=_json_default)
+            html += '<canvas data-config="{}"></canvas>\n'.format(
+                html_mod.escape(config_json, quote=True)
             )
             html += '</div>\n'
         

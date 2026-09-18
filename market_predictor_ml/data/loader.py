@@ -78,61 +78,6 @@ def download_multiple_stocks(
     
     return data
 
-
-def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Basic preprocessing: handle missing values, ensure proper types.
-    
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Raw price data
-    
-    Returns
-    -------
-    pd.DataFrame
-        Preprocessed data
-    """
-    df = df.copy()
-    
-    # Forward fill then backward fill for any remaining NaNs
-    df = df.ffill().bfill()
-    
-    # Remove any rows that still have NaNs
-    df = df.dropna()
-    
-    # Ensure numeric types
-    numeric_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
-    for col in numeric_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-    
-    return df
-
-
-def compute_returns(df: pd.DataFrame, periods: List[int] = [1, 5, 21]) -> pd.DataFrame:
-    """
-    Compute simple and log returns for multiple periods.
-    
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Price data with 'Close' column
-    periods : List[int]
-        List of periods for return calculation
-    
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame with added return columns
-    """
-    df = df.copy()
-    
-    for period in periods:
-        # Simple returns
-        df[f'Return_{period}d'] = df['Close'].pct_change(periods=period)
-        
-        # Log returns
-        df[f'LogReturn_{period}d'] = np.log(df['Close'] / df['Close'].shift(period))
-    
-    return df
+# Single source of truth for preprocessing lives in providers.py
+# (M-9: these two functions were duplicated verbatim here).
+from .providers import compute_returns, preprocess_data  # noqa: E402,F401

@@ -387,8 +387,13 @@ def run_walk_forward_backtest(
         else:
             positions = create_positions(predictions, method=position_method)
         
-        # Compute returns (position * future return)
-        strategy_returns = positions * y_test
+        # Compute returns: the position decided at close t earns the NEXT
+        # bar return (position.shift(1) * next_day_return), matching the
+        # README methodology and avoiding trade-at-close look-ahead.
+        n = len(y_test)
+        strategy_returns = np.zeros(n)
+        if n > 1:
+            strategy_returns[1:] = positions[:-1] * y_test[1:]
         
         # Apply transaction costs
         strategy_returns = apply_transaction_costs(

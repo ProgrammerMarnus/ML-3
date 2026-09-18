@@ -7,6 +7,11 @@ Implements:
 - Fixed fraction
 - Signal strength based
 - Risk parity approaches
+
+NOTE (M-9): this class-based IPositionSizer hierarchy overlaps with the
+functional API in decision/sizing.py. decision/sizing.py is the implementation
+used by optimization/hyperopt.py; prefer create_position_sizer() here for
+interface-driven code so the two implementations do not drift apart.
 """
 
 import numpy as np
@@ -74,8 +79,8 @@ class VolatilityAdjustedPositionSizer(IPositionSizer):
         # Apply signal direction and strength
         position = base_position * np.clip(signal, -1, 1)
         
-        # Apply limits
-        position = np.clip(position, self.min_position, self.max_position)
+        # Apply symmetric limits (honor the -1..1 signal contract; long-only is enforced at the strategy layer)
+        position = np.clip(position, -self.max_position, self.max_position)
         
         return position
     
@@ -139,14 +144,27 @@ class KellyPositionSizer(IPositionSizer):
         float
             Position size as fraction of capital
         """
-        # Estimate win probability from signal
-        # Higher signal = higher win probability
-        win_prob = 0.5 + signal * 0.25  # Maps signal to ~0.25-0.75 range
-        win_prob = np.clip(win_prob, self.min_win_rate, 1 - self.min_win_rate)
-        
-        # Estimate payoff ratio (average win / average loss)
-        # Assume symmetric for simplicity, can be enhanced with historical data
-        payoff_ratio = 1.0
+        # Prefer historical win rate / payoff ratio when history is available
+        # (L-11: update_history() populated _trade_history but it was unused);
+        # fall back to the signal-derived estimate otherwise.
+        history = np.asarray(self._trade_history, dtype=float)
+        history = history[np.isfinite(history)]
+        if history.size >= 10:
+            wins = history[history > 0]
+            losses = history[history < 0]
+            if wins.size and losses.size:
+                win_prob = float(wins.size / history.size)
+                payoff_ratio = float(np.mean(wins) / abs(np.mean(losses)))
+            else:
+                win_prob = float(history.mean() > 0)
+                payoff_ratio = 1.0
+        else:
+            # Estimate win probability from signal (higher = higher win prob)
+            win_prob = 0.5 + signal * 0.25  # Maps signal to ~0.25-0.75 range
+            # Assume symmetric payoff without history
+            payoff_ratio = 1.0
+
+        win_prob = float(np.clip(win_prob, self.min_win_rate, 1 - self.min_win_rate))
         
         # Kelly formula: f* = (p * b - q) / b
         # where p = win prob, q = loss prob, b = payoff ratio

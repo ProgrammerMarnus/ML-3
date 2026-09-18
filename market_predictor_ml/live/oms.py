@@ -7,6 +7,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional, Dict, List, Callable
 import uuid
+import threading
 import logging
 
 logger = logging.getLogger(__name__)
@@ -195,7 +196,7 @@ class OrderManager:
         self._active_orders: set = set()
         self._callbacks: List[Callable[[Order], None]] = []
         self._positions: Dict[str, float] = {}  # symbol -> net position
-        self._lock = None  # Could use threading.Lock for thread safety
+        self._lock = threading.RLock()  # Reentrant: callbacks may re-enter OMS methods
     
     def register_callback(self, callback: Callable[[Order], None]):
         """Register callback for order status changes."""
@@ -231,11 +232,12 @@ class OrderManager:
             time_in_force=time_in_force,
             metadata=metadata or {},
         )
-        
-        self._orders[order.order_id] = order
-        
-        if symbol not in self._orders_by_symbol:
-            self._orders_by_symbol[symbol] = []
+        with self._lock:
+            self._orders[order.order_id] = order
+
+            if symbol not in self._orders_by_symbol:
+                self._orders_by_symbol[symbol] = []
+    
         self._orders_by_symbol[symbol].append(order.order_id)
         
         logger.info(
@@ -254,10 +256,10 @@ class OrderManager:
         order = self._orders[order_id]
         if not order.is_active:
             logger.warning(f"Order {order_id} is not active")
-            return False
-        
-        order.update_status(OrderStatus.SUBMITTED)
-        self._active_orders.add(order_id)
+        with self._lock:
+            order.update_status(OrderStatus.SUBMITTED)
+            self._active_orders.add(order_id)
+
         self._notify_callbacks(order)
         return True
     
@@ -284,33 +286,35 @@ class OrderManager:
         
         order = self._orders[order_id]
         
-        # Update filled quantities
-        old_filled = order.filled_quantity
-        order.filled_quantity += filled_quantity
-        order.remaining_quantity -= filled_quantity
-        order.commission += commission
-        
-        # Update average fill price
-        if order.avg_fill_price is None:
-            order.avg_fill_price = fill_price
-        else:
-            total_value = (order.avg_fill_price * old_filled) + (fill_price * filled_quantity)
-            order.avg_fill_price = total_value / order.filled_quantity
-        
-        # Update position
-        position_change = filled_quantity if order.side == OrderSide.BUY else -filled_quantity
-        current_pos = self._positions.get(order.symbol, 0.0)
-        self._positions[order.symbol] = current_pos + position_change
-        
-        # Update status
-        if order.remaining_quantity <= 0:
-            order.update_status(
-                OrderStatus.FILLED,
-                filled_at=datetime.now(),
-            )
-            self._active_orders.discard(order_id)
-        else:
-            order.update_status(OrderStatus.PARTIALLY_FILLED)
+        # Update filled quantities, average price, position and status atomically
+        with self._lock:
+            old_filled = order.filled_quantity
+            order.filled_quantity += filled_quantity
+            order.remaining_quantity -= filled_quantity
+            order.commission += commission
+
+            # Update average fill price
+            if order.avg_fill_price is None:
+                order.avg_fill_price = fill_price
+            else:
+                total_value = (order.avg_fill_price * old_filled) + (fill_price * filled_quantity)
+                order.avg_fill_price = total_value / order.filled_quantity
+
+            # Update position
+            position_change = filled_quantity if order.side == OrderSide.BUY else -filled_quantity
+            current_pos = self._positions.get(order.symbol, 0.0)
+            self._positions[order.symbol] = current_pos + position_change
+
+            # Update status
+            if order.remaining_quantity <= 0:
+                order.update_status(
+                    OrderStatus.FILLED,
+                    filled_at=datetime.now(),
+                )
+                self._active_orders.discard(order_id)
+            else:
+                order.update_status(OrderStatus.PARTIALLY_FILLED)
+
         
         logger.info(
             f"Fill update: {filled_quantity} @ {fill_price} (pos: {self._positions[order.symbol]})",
@@ -323,30 +327,26 @@ class OrderManager:
         """Cancel an active order."""
         if order_id not in self._orders:
             return False
-        
-        order = self._orders[order_id]
-        if not order.is_active:
-            return False
-        
-        order.update_status(
-            OrderStatus.CANCELLED,
-            metadata={**order.metadata, "cancel_reason": reason},
-        )
-        self._active_orders.discard(order_id)
+        with self._lock:
+            order.update_status(
+                OrderStatus.CANCELLED,
+                metadata={**order.metadata, "cancel_reason": reason},
+            )
+            self._active_orders.discard(order_id)
         self._notify_callbacks(order)
         return True
-    
     def reject_order(self, order_id: str, reason: str = ""):
         """Mark order as rejected."""
         if order_id not in self._orders:
             return
         
         order = self._orders[order_id]
-        order.update_status(
-            OrderStatus.REJECTED,
-            metadata={**order.metadata, "reject_reason": reason},
-        )
-        self._active_orders.discard(order_id)
+        with self._lock:
+            order.update_status(
+                OrderStatus.REJECTED,
+                metadata={**order.metadata, "reject_reason": reason},
+            )
+            self._active_orders.discard(order_id)
         self._notify_callbacks(order)
     
     def get_order(self, order_id: str) -> Optional[Order]:

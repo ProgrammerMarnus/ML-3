@@ -430,12 +430,26 @@ class LabelGenerator(ILabelGenerator):
         Type of label: 'direction', 'return', 'triple_barrier'
     threshold : float
         Threshold for direction classification (if applicable)
+    profit_target : float, optional
+        Triple-barrier upper barrier as a fraction (defaults to threshold)
+    stop_loss : float, optional
+        Triple-barrier lower barrier as a positive fraction (defaults to threshold)
     """
-    
-    def __init__(self, horizon: int = 5, label_type: str = 'direction', threshold: float = 0.0):
+
+    def __init__(
+        self,
+        horizon: int = 5,
+        label_type: str = 'direction',
+        threshold: float = 0.0,
+        profit_target: Optional[float] = None,
+        stop_loss: Optional[float] = None,
+    ):
         self.horizon = horizon
         self.label_type = label_type
         self.threshold = threshold
+        # Triple-barrier barriers may differ from the direction threshold (L-3)
+        self.profit_target = profit_target if profit_target is not None else threshold
+        self.stop_loss = stop_loss if stop_loss is not None else threshold
         self._label_columns = []
     
     def generate(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -465,9 +479,9 @@ class LabelGenerator(ILabelGenerator):
     
     def _triple_barrier_method(self, df: pd.DataFrame) -> pd.DataFrame:
         """Implement triple barrier labeling method."""
-        # Simplified implementation
-        pt = self.threshold  # Profit target
-        sl = -self.threshold  # Stop loss
+        # Use the dedicated triple-barrier barriers when provided (L-3)
+        pt = self.profit_target  # Profit target (upper barrier)
+        sl = -self.stop_loss  # Stop loss (lower barrier)
         
         labels = []
         for i in range(len(df) - self.horizon):
@@ -505,7 +519,9 @@ class LabelGenerator(ILabelGenerator):
         return {
             'horizon': self.horizon,
             'label_type': self.label_type,
-            'threshold': self.threshold
+            'threshold': self.threshold,
+            'profit_target': self.profit_target,
+            'stop_loss': self.stop_loss,
         }
 
 

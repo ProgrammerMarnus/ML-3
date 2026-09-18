@@ -201,8 +201,15 @@ class PortfolioManager:
         available_cash = self._cash_balance
         portfolio_value = self._portfolio_value
         
+        # Enforce min_position_weight: any held symbol whose target weight is
+        # below the minimum is closed (target 0) (L-12).
+        targets = dict(target_weights)
+        for symbol in self._positions:
+            if targets.get(symbol, 0.0) < self.min_position_weight:
+                targets[symbol] = 0.0
+
         # Calculate target values
-        for symbol, target_weight in target_weights.items():
+        for symbol, target_weight in targets.items():
             # Enforce constraints
             target_weight = min(target_weight, self.max_position_weight)
             
@@ -266,33 +273,36 @@ class PortfolioManager:
         if not signal.is_actionable:
             return None
         
-        # Check constraints
-        current_pos = self.get_position(signal.symbol)
-        current_weight = current_pos.weight if current_pos else 0.0
-        
-        if signal.signal_type in [SignalType.LONG, SignalType.INCREASE_LONG]:
-            new_weight = current_weight + (signal.target_quantity * signal.entry_price / self._portfolio_value)
-            if new_weight > self.max_position_weight:
-                logger.warning(f"Signal would exceed max weight for {signal.symbol}")
+        # Weight check uses the ABSOLUTE desired position (target_quantity)
+        entry_price = signal.entry_price or 0.0
+        if self._portfolio_value > 0 and entry_price > 0:
+            desired_weight = abs(signal.target_quantity) * entry_price / self._portfolio_value
+            if desired_weight > self.max_position_weight:
+                logger.warning(
+                    f"Signal would exceed max weight for {signal.symbol} "
+                    f"(desired {desired_weight:.2%} > limit {self.max_position_weight:.2%})"
+                )
                 return None
         
-        # Create order
-        if signal.signal_type in [SignalType.LONG, SignalType.INCREASE_LONG, SignalType.DECREASE_SHORT]:
+        # Create order from the SIGNED delta (side and size both follow the delta)
+        if signal.delta_quantity > 0:
             side = OrderSide.BUY
-        elif signal.signal_type in [SignalType.SHORT, SignalType.INCREASE_SHORT, SignalType.DECREASE_LONG]:
+        elif signal.delta_quantity < 0:
             side = OrderSide.SELL
         else:
-            return None
+            return None  # nothing to trade
         
         order = self.order_manager.create_order(
             symbol=signal.symbol,
             side=side,
-            quantity=signal.target_quantity,
+            quantity=abs(signal.delta_quantity),
             order_type=OrderType.MARKET,
             metadata={
                 "reason": "signal",
                 "signal_type": signal.signal_type.value,
                 "signal_strength": signal.strength,
+                "target_quantity": signal.target_quantity,
+                "delta_quantity": signal.delta_quantity,
             },
         )
         

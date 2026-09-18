@@ -263,8 +263,13 @@ class BacktestDashboard:
                   self.equity_curve['equity'].pct_change())
         returns = returns.dropna()
         
-        # Reshape to year x month matrix
-        monthly = returns.resample('M').apply(lambda x: (1 + x).prod() - 1)
+        # Resample to month-end requires a DatetimeIndex; guard when the
+        # equity curve was built from a naked numpy array (integer index).
+        if not isinstance(returns.index, pd.DatetimeIndex):
+            ax.text(0.5, 0.5, 'Monthly heatmap requires a datetime index',
+                    transform=ax.transAxes, ha='center')
+            return ax
+        monthly = returns.resample('ME').apply(lambda x: (1 + x).prod() - 1)
         monthly_df = pd.DataFrame({
             'year': monthly.index.year,
             'month': monthly.index.month,
@@ -285,9 +290,9 @@ class BacktestDashboard:
                       vmin=-0.2, vmax=0.2)
         
         # Set ticks
-        ax.set_xticks(range(12))
+        ax.set_xticks(range(len(heatmap_data.columns)))
         ax.set_yticks(range(len(heatmap_data.index)))
-        ax.set_xticklabels(months_labels)
+        ax.set_xticklabels([months_labels[m - 1] for m in heatmap_data.columns])
         ax.set_yticklabels(heatmap_data.index)
         
         # Add colorbar
@@ -296,7 +301,7 @@ class BacktestDashboard:
         
         # Add text annotations
         for i in range(len(heatmap_data.index)):
-            for j in range(12):
+            for j in range(len(heatmap_data.columns)):
                 value = heatmap_data.iloc[i, j]
                 if not np.isnan(value):
                     color = 'white' if abs(value) > 0.1 else 'black'

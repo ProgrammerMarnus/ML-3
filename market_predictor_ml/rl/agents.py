@@ -3,9 +3,18 @@ RL Agents using Stable Baselines3.
 Implements PPO and DQN for trading strategies.
 """
 
+from __future__ import annotations
+
 from typing import Optional, Dict, Any
 import numpy as np
-import gymnasium as gym
+
+# gymnasium is optional here: it is only referenced in type hints, and
+# `from __future__ import annotations` keeps those unevaluated. The real
+# requirement is enforced by the factory functions (via stable-baselines3).
+try:
+    import gymnasium as gym
+except ImportError:  # pragma: no cover - optional dependency
+    gym = None
 
 try:
     from stable_baselines3 import PPO, DQN

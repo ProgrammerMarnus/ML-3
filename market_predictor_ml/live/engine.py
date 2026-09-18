@@ -8,6 +8,7 @@ from enum import Enum
 import logging
 import time
 import threading
+import queue
 
 from .oms import OrderManager, Order, OrderStatus
 from .signals import SignalGenerator, TradingSignal
@@ -103,9 +104,9 @@ class TradingEngine:
         self._running = False
         self._loop_thread: Optional[threading.Thread] = None
         
-        # Event queues
-        self._market_events: List[MarketEvent] = []
-        self._signal_events: List[SignalEvent] = []
+        # Event queues (thread-safe: producers run on caller threads)
+        self._market_events: "queue.Queue" = queue.Queue()
+        self._signal_events: "queue.Queue" = queue.Queue()
         
         # Callbacks
         self._event_callbacks: List[Callable] = []
@@ -114,6 +115,7 @@ class TradingEngine:
         self._events_processed = 0
         self._orders_generated = 0
         self._last_heartbeat: Optional[datetime] = None
+        self._last_portfolio_value: float = 0.0
     
     def register_callback(self, callback: Callable):
         """Register callback for events."""
@@ -165,6 +167,11 @@ class TradingEngine:
         self._running = False
         self._state = TradingState.STOPPED
         
+        # Join the event-loop thread (it blocks on the queue with a 0.1 s
+        # timeout, so it exits promptly once _running is False)
+        if self._loop_thread is not None and self._loop_thread.is_alive():
+            self._loop_thread.join(timeout=2.0)
+        
         # Disconnect from broker
         self.broker.disconnect()
         
@@ -201,31 +208,41 @@ class TradingEngine:
     def _run_event_loop(self):
         """Main event loop running in background thread."""
         logger.info("Event loop started")
-        
+        risk_check_interval = 1.0  # seconds between periodic risk checks
+        last_risk_check = 0.0
+
         while self._running:
             try:
-                # Process market events
-                if self._market_events:
-                    event = self._market_events.pop(0)
+                # Block until a market event arrives (or timeout so risk checks
+                # and shutdown stay responsive). No busy polling.
+                try:
+                    event = self._market_events.get(timeout=0.1)
+                except queue.Empty:
+                    event = None
+
+                if event is not None:
                     self._process_market_event(event)
-                
-                # Process signal events
-                if self._signal_events:
-                    event = self._signal_events.pop(0)
-                    self._process_signal_event(event)
-                
+
+                # Drain any signal events that arrived
+                while True:
+                    try:
+                        signal_event = self._signal_events.get_nowait()
+                    except queue.Empty:
+                        break
+                    self._process_signal_event(signal_event)
+
                 # Check risk metrics periodically
-                self._check_risk()
-                
+                now = time.monotonic()
+                if now - last_risk_check >= risk_check_interval:
+                    self._check_risk()
+                    last_risk_check = now
+
                 # Update heartbeat
                 self._last_heartbeat = datetime.now()
-                
-                # Small sleep to prevent CPU spinning
-                time.sleep(0.1)
-                
+
             except Exception as e:
                 logger.error(f"Event loop error: {e}", exc_info=True)
-        
+
         logger.info("Event loop stopped")
     
     def on_market_data(self, symbol: str, price: float, timestamp: datetime, volume: float = 0):
@@ -234,7 +251,7 @@ class TradingEngine:
             return
         
         event = MarketEvent(symbol, price, timestamp, volume)
-        self._market_events.append(event)
+        self._market_events.put(event)
     
     def on_prediction(self, symbol: str, prediction: float):
         """Handle new model prediction."""
@@ -247,7 +264,7 @@ class TradingEngine:
             return
         
         current_position = self.order_manager.get_position(symbol)
-        account_value = self.risk_monitor._current_value or 100000.0
+        account_value = self.risk_monitor.current_value or 100000.0
         
         # Generate signal
         signal = self.signal_generator.generate_signal(
@@ -261,7 +278,7 @@ class TradingEngine:
         
         if signal.is_actionable:
             event = SignalEvent(signal)
-            self._signal_events.append(event)
+            self._signal_events.put(event)
     
     def _process_market_event(self, event: MarketEvent):
         """Process market data event."""
@@ -270,13 +287,20 @@ class TradingEngine:
         # Update portfolio prices
         self.portfolio_manager.update_price(event.symbol, event.price)
         
-        # Update broker price (for paper broker)
-        if isinstance(self.broker, PaperBroker):
-            self.broker.set_price(event.symbol, event.price)
+        # Forward the price to the broker via the adapter interface
+        # (PaperBroker tracks it for fill simulation; others ignore it)
+        try:
+            self.broker.update_price(event.symbol, event.price)
+        except Exception:  # never let a price-book update break the loop
+            logger.debug("broker.update_price failed", exc_info=True)
         
-        # Update risk monitor
+        # Update risk monitor (feed returns so volatility/VaR checks have data)
         portfolio_value = self.portfolio_manager.get_portfolio_value()
+        prev_value = self._last_portfolio_value
+        if prev_value > 0:
+            self.risk_monitor.add_return((portfolio_value - prev_value) / prev_value)
         self.risk_monitor.update_portfolio_value(portfolio_value)
+        self._last_portfolio_value = portfolio_value
         
         self._notify_callbacks("market_data", event)
     

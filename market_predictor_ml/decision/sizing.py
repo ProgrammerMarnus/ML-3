@@ -11,6 +11,7 @@ Converts model predictions into trading positions using:
 import numpy as np
 import pandas as pd
 from typing import Optional, Tuple
+import inspect
 
 
 def fixed_fractional_position(
@@ -97,11 +98,13 @@ def volatility_adjusted_position(
 
 def kelly_criterion_position(
     predictions: np.ndarray,
+    volatility: Optional[np.ndarray] = None,
     win_rate: Optional[float] = None,
     avg_win: Optional[float] = None,
     avg_loss: Optional[float] = None,
     fraction: float = 0.25,
-    max_position: float = 1.0
+    max_position: float = 1.0,
+    **kwargs,
 ) -> np.ndarray:
     """
     Fractional Kelly criterion position sizing.
@@ -114,6 +117,10 @@ def kelly_criterion_position(
     ----------
     predictions : np.ndarray
         Expected returns
+    volatility : np.ndarray, optional
+        Per-asset return volatility (std). Kelly uses mu / sigma^2, so the
+        asset's own variance is required; the cross-sectional variance of
+        the prediction vector is NOT used (H-6).
     win_rate : float, optional
         Historical win rate (if None, estimated from predictions)
     avg_win : float, optional
@@ -130,14 +137,20 @@ def kelly_criterion_position(
     np.ndarray
         Position sizes
     """
-    # Simplified Kelly for continuous returns: f* = E[r] / Var(r)
-    # We use a simplified version based on prediction magnitude
-    
-    # Estimate variance from prediction spread if not provided
-    pred_var = np.var(predictions) + 1e-10
-    
+    # Kelly for Gaussian returns: f* = mu / sigma^2 where sigma^2 is the
+    # ASSET'S return variance (per-asset volatility), not the cross-sectional
+    # variance of the prediction vector (H-6).
+    preds = np.asarray(predictions, dtype=float)
+    if volatility is None:
+        vol = np.full_like(preds, float(np.std(preds)) if preds.size else 1e-6)
+    else:
+        vol = np.asarray(volatility, dtype=float)
+        if vol.shape != preds.shape:
+            vol = np.broadcast_to(vol, preds.shape).copy()
+    vol_safe = np.maximum(vol, 1e-6)
+
     # Kelly fraction for each prediction
-    kelly_f = predictions / pred_var
+    kelly_f = preds / (vol_safe ** 2)
     
     # Apply fractional Kelly
     positions = fraction * kelly_f
@@ -185,16 +198,30 @@ def signal_strength_position(
     
     z_scores = (pred_series - rolling_mean) / rolling_std
     
-    # Convert z-score to position using sigmoid-like function
-    # This naturally bounds positions while allowing gradation
-    positions = np.tanh(z_scores.values) * max_position
-    
-    # Apply power for more/less aggressive sizing
+    # Convert z-score to position using sigmoid-like function.
+    # This naturally bounds positions while allowing gradation.
+    # Apply the power to the tanh output BEFORE the single max_position
+    # scaling (H-5: scaling twice yields max_position^(power+1)).
+    raw = np.tanh(z_scores.values)
     if power != 1.0:
-        positions = np.sign(positions) * (np.abs(positions) ** power) * max_position
+        raw = np.sign(raw) * (np.abs(raw) ** power)
+    positions = raw * max_position
     
     return positions
 
+
+# Map each sizing function to the set of keyword parameter names it accepts.
+# This lets create_positions forward a common kwargs dict safely without
+# raising TypeError for parameters the target function does not expect.
+_SIZE_FUNC_PARAMS = {
+    func: set(inspect.signature(func).parameters.keys())
+    for func in (fixed_fractional_position, volatility_adjusted_position,
+                 kelly_criterion_position, signal_strength_position)
+}
+
+def _filter_kwargs(func, kwargs):
+    allowed = _SIZE_FUNC_PARAMS[func]
+    return {k: v for k, v in kwargs.items() if k in allowed}
 
 def create_positions(
     predictions: np.ndarray,
@@ -222,14 +249,14 @@ def create_positions(
         Position sizes
     """
     if method == 'fixed':
-        return fixed_fractional_position(predictions, **kwargs)
+        return fixed_fractional_position(predictions, **_filter_kwargs(fixed_fractional_position, kwargs))
     elif method == 'volatility_adjusted':
         if volatility is None:
             raise ValueError("Volatility required for volatility_adjusted method")
-        return volatility_adjusted_position(predictions, volatility, **kwargs)
+        return volatility_adjusted_position(predictions, volatility, **_filter_kwargs(volatility_adjusted_position, kwargs))
     elif method == 'kelly':
-        return kelly_criterion_position(predictions, **kwargs)
+        return kelly_criterion_position(predictions, **_filter_kwargs(kelly_criterion_position, kwargs))
     elif method == 'signal_strength':
-        return signal_strength_position(predictions, **kwargs)
+        return signal_strength_position(predictions, **_filter_kwargs(signal_strength_position, kwargs))
     else:
         raise ValueError(f"Unknown position sizing method: {method}")

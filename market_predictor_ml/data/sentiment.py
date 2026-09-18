@@ -4,6 +4,8 @@ Fetches news and calculates sentiment scores for trading signals.
 """
 
 import pandas as pd
+import zlib
+
 import numpy as np
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
@@ -51,7 +53,8 @@ class SentimentAnalyzer:
     
     def _get_mock_news(self, ticker: str, days: int = 7) -> List[Dict]:
         """Generate mock news for testing."""
-        np.random.seed(hash(ticker) % 2**32)
+        # zlib.crc32 is stable across processes (str hash is salted per run)
+        np.random.seed(zlib.crc32(ticker.encode("utf-8")) & 0xFFFFFFFF)
         
         base_titles = [
             f"{ticker} reports strong earnings beat",
@@ -162,20 +165,35 @@ class SentimentAnalyzer:
             start="2020-01-01", periods=len(price_df)
         )
         
-        sentiment_scores = []
-        for date in dates:
-            days_back = (dates[-1] - date).days if hasattr(date, '__sub__') else 0
-            news = self.fetch_news(ticker, max(1, days_back + 7))
-            
-            # Filter news up to this date
-            relevant_news = [n for n in news if n["timestamp"].date() <= date.date()]
-            
-            if len(relevant_news) > 0:
-                scores = [self.calculate_sentiment(n["title"])[0] for n in relevant_news]
-                sentiment_scores.append(np.mean(scores))
-            else:
-                sentiment_scores.append(0.0)
-        
+        # Fetch/generate news ONCE for the whole span, then build a single
+        # per-day sentiment series and walk it (O(n) instead of O(n^2)).
+        span_days = 0
+        try:
+            span_days = max(0, int((dates[-1] - dates[0]).days)) if len(dates) > 1 else 0
+        except Exception:
+            span_days = 0
+        news = sorted(
+            self.fetch_news(ticker, days=span_days + 7),
+            key=lambda n: n["timestamp"],
+        )
+        from collections import defaultdict as _dd
+        per_day = _dd(list)
+        for item in news:
+            polarity, _ = self.calculate_sentiment(item["title"])
+            ts = item["timestamp"]
+            per_day[ts.date() if hasattr(ts, "date") else ts].append(polarity)
+        sent_series = pd.Series(
+            {d: float(np.mean(v)) for d, v in per_day.items()}
+        )
+        if not sent_series.empty:
+            sent_series.index = pd.to_datetime(sent_series.index)
+            sent_series = sent_series.sort_index()
+        # Align to the price index (date-normalized), forward-fill gaps.
+        norm_index = pd.DatetimeIndex(dates).normalize()
+        sentiment_scores = list(
+            sent_series.reindex(norm_index).ffill().fillna(0.0).values
+        )
+
         # Create features
         df = pd.DataFrame({
             "sentiment_raw": sentiment_scores,

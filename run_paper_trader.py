@@ -87,8 +87,6 @@ class PaperTradingSystem:
         self.state_store = create_state_store(db_path=db_path)
         logger.info(f"State store initialized at {db_path}")
         
-        self._load_previous_state()
-        
         data_config = self.config.get("data", {})
         provider_type = data_config.get("provider", "yfinance")
         cache_dir = data_config.get("cache_dir", "./data_cache")
@@ -143,6 +141,7 @@ class PaperTradingSystem:
             cash_buffer=max(0.0, 1.0 - portfolio_config.get("max_total_exposure", 1.0)),
         )
         self.portfolio_manager.update_cash(initial_cash)
+        self._load_previous_state()
         logger.info(f"Portfolio manager initialized with ${initial_cash:,.2f}")
         
         risk_config = self.config.get("risk", {})
@@ -238,25 +237,46 @@ class PaperTradingSystem:
     
     def _load_previous_state(self):
         try:
+            if self.portfolio_manager is None:
+                return
+
+            # Restore portfolio cash first (must exist before positions)
             portfolio_state = self.state_store.load_portfolio_state()
             if portfolio_state:
-                logger.info(f"Loaded previous portfolio state: cash=${portfolio_state.get('current_cash', 0):,.2f}")
-            
+                cash = float(portfolio_state.get("current_cash", 0.0))
+                if cash:
+                    self.portfolio_manager.update_cash(cash)
+                    self.initial_cash = float(portfolio_state.get("initial_cash", cash))
+                    logger.info(f"Restored cash=${cash:,.2f} from previous session")
+
+            # Restore positions
             positions = self.state_store.load_positions()
             if positions:
-                logger.info(f"Loaded {len(positions)} previous positions")
-            
+                for symbol, pos in positions.items():
+                    qty = float(pos.get("quantity", 0.0))
+                    avg_cost = float(pos.get("avg_cost", 0.0))
+                    price = float(pos.get("current_price", avg_cost))
+                    if price > 0:
+                        self.portfolio_manager.update_price(symbol, price)
+                    if qty != 0.0:
+                        self.portfolio_manager.update_position(symbol, qty, avg_cost)
+                logger.info(f"Restored {len(positions)} positions from previous session")
+
+            # Restore risk state (trading halted flag)
             risk_state = self.state_store.load_risk_state()
             if risk_state and risk_state.get("trading_halted"):
-                logger.warning(f"Previous session ended with trading halted: {risk_state.get('halt_reason')}")
-            
-            active_session = self.state_store.get_active_session()
-            if active_session:
-                self.session_id = active_session["id"]
+                logger.warning(
+                    f"Previous session ended with trading halted: {risk_state.get('halt_reason')}"
+                )
+
+            # Restore active session id
+            active = self.state_store.get_active_session()
+            if active:
+                self.session_id = active["id"]
                 logger.info(f"Continuing active session {self.session_id}")
         except Exception as e:
             logger.error(f"Error loading previous state: {e}")
-    
+
     def _setup_alert_rules(self):
         if not self.alert_manager:
             return
@@ -357,7 +377,10 @@ class PaperTradingSystem:
         portfolio_config = self.config.get("portfolio", {})
         initial_cash = portfolio_config.get("initial_cash", 100000.0)
         
-        self.initial_cash = initial_cash
+        # On a fresh start use the configured initial cash; on restart the
+        # restored value from _load_previous_state takes precedence.
+        if self.initial_cash == 0.0:
+            self.initial_cash = initial_cash
 
         if self.session_id is None:
             self.session_id = self.state_store.start_session(initial_cash)

@@ -31,7 +31,8 @@ class TradingSignal:
         symbol: Ticker symbol
         signal_type: Type of signal (long, short, flat, etc.)
         strength: Signal confidence/strength (-1 to 1 or 0 to 1)
-        target_quantity: Desired position size
+        target_quantity: ABSOLUTE desired position size (signed)
+        delta_quantity: Signed quantity to actually trade to reach the target
         entry_price: Suggested entry price
         stop_loss: Stop loss price level
         take_profit: Take profit price level
@@ -40,7 +41,8 @@ class TradingSignal:
     symbol: str
     signal_type: SignalType
     strength: float
-    target_quantity: float = 0.0
+    target_quantity: float = 0.0    # ABSOLUTE desired position
+    delta_quantity: float = 0.0     # signed trade needed to reach the target
     entry_price: Optional[float] = None
     stop_loss: Optional[float] = None
     take_profit: Optional[float] = None
@@ -65,6 +67,7 @@ class TradingSignal:
             "signal_type": self.signal_type.value,
             "strength": self.strength,
             "target_quantity": self.target_quantity,
+            "delta_quantity": self.delta_quantity,
             "entry_price": self.entry_price,
             "stop_loss": self.stop_loss,
             "take_profit": self.take_profit,
@@ -168,23 +171,33 @@ class SignalGenerator:
             signal_type = SignalType.FLAT
             strength = 0.0
         
-        # Calculate target quantity based on strength and volatility
+        # Calculate position sizes based on strength and volatility
         if signal_type != SignalType.FLAT:
-            # Risk-based position sizing
+            # Risk-based position sizing: absolute size of the desired position
             risk_per_trade = account_value * 0.02  # 2% risk
             dollar_volatility = current_price * volatility
-            target_quantity = risk_per_trade / dollar_volatility * abs(strength)
-            target_quantity = round(target_quantity, 0)
-            
-            # Adjust for existing position
-            if current_position != 0:
-                if (current_position > 0 and signal_type in [SignalType.LONG, SignalType.INCREASE_LONG]) or \
-                   (current_position < 0 and signal_type in [SignalType.SHORT, SignalType.INCREASE_SHORT]):
-                    target_quantity = abs(target_quantity - abs(current_position))
+
+            if dollar_volatility <= 0:
+                # Cannot size without a positive price/volatility; stay flat
+                target_quantity = 0.0
+                delta_quantity = 0.0
+            else:
+                desired_abs = risk_per_trade / dollar_volatility * abs(strength)
+                desired_abs = round(desired_abs, 0)
+
+                # Bullish signal types want a long target; bearish want a short target
+                if signal_type in [SignalType.LONG, SignalType.INCREASE_LONG, SignalType.DECREASE_SHORT]:
+                    sign = 1.0
                 else:
-                    target_quantity = min(target_quantity, abs(current_position))
+                    sign = -1.0
+
+                # ABSOLUTE desired position (what the model wants to hold)
+                target_quantity = desired_abs * sign
+                # Signed trade needed to move from the current position to the target
+                delta_quantity = target_quantity - current_position
         else:
             target_quantity = 0.0
+            delta_quantity = 0.0
         
         # Calculate entry/exit levels
         entry_price = current_price
@@ -200,6 +213,7 @@ class SignalGenerator:
             signal_type=signal_type,
             strength=strength,
             target_quantity=target_quantity,
+            delta_quantity=delta_quantity,
             entry_price=entry_price,
             stop_loss=stop_loss,
             take_profit=take_profit,
@@ -223,7 +237,8 @@ class SignalGenerator:
         if signal.is_actionable:
             self._notify_callbacks(signal)
             logger.info(
-                f"Signal: {signal_type.value} {symbol} (strength: {strength:.2f}, qty: {target_quantity})",
+                f"Signal: {signal_type.value} {symbol} (strength: {strength:.2f}, "
+                f"target: {target_quantity}, delta: {delta_quantity})",
                 extra={"symbol": symbol, "signal_type": signal_type.value}
             )
         

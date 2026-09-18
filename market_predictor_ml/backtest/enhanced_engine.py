@@ -56,7 +56,11 @@ class Trade:
             'slippage': self.slippage,
             'mae': self.mae,
             'mfe': self.mfe,
-            'return_pct': (self.exit_price - self.entry_price) / self.entry_price if self.exit_price else None
+            'return_pct': (
+                (self.exit_price - self.entry_price) / self.entry_price
+                if self.side == 'long'
+                else (self.entry_price - self.exit_price) / self.entry_price
+            ) if self.exit_price is not None else None
         }
 
 
@@ -144,8 +148,9 @@ class TransactionCostModel:
         # Commission
         commission_cost = max(notional * self.commission, self.min_commission)
         
-        # Spread cost (half spread for round-trip)
-        spread_cost = notional * self.spread
+        # Spread cost: `spread` is the full quoted bid-ask spread, so a
+        # single one-way trade crosses half of it (L-1).
+        spread_cost = notional * self.spread * 0.5
         
         # Market impact/slippage
         slippage_cost = 0.0
@@ -254,13 +259,15 @@ class EnhancedBacktestEngine(IBacktestEngine):
         transaction_cost_model: Optional[TransactionCostModel] = None,
         benchmark: Optional[Benchmark] = None,
         max_position_size: float = 0.1,
-        max_portfolio_turnover: float = 0.5
+        max_portfolio_turnover: float = 0.5,
+        max_gross_exposure: float = 1.0,
     ):
         self.initial_capital = initial_capital
         self.cost_model = transaction_cost_model or TransactionCostModel()
         self.benchmark = benchmark
         self.max_position_size = max_position_size
         self.max_portfolio_turnover = max_portfolio_turnover
+        self.max_gross_exposure = max_gross_exposure  # cap on SUM(|positions|) / capital
         
         # State
         self._positions: Dict[str, Position] = {}
@@ -298,6 +305,7 @@ class EnhancedBacktestEngine(IBacktestEngine):
         self._positions = {}
         self._trades = []
         self._equity_curve = pd.Series(dtype=float)
+        self._price_history: Dict[str, list] = {}
         
         dates = signals.index
         symbols = signals.columns
@@ -307,16 +315,26 @@ class EnhancedBacktestEngine(IBacktestEngine):
         dates_history = []
         
         for date_idx, date in enumerate(dates):
+            # Reset the per-day traded-notional counter for turnover throttling
+            self._day_traded_notional = 0.0
             # Get current prices
             current_prices = prices.loc[date]
+            # Record today's close for every open position (MAE/MFE path, H-10)
+            for _sym in list(self._positions.keys()):
+                self._price_history.setdefault(_sym, []).append(float(current_prices[_sym]))
             
             # Update existing positions and close if signal changed
+            # Update existing positions: close on NaN/0 or when signal flips sign
             for symbol in list(self._positions.keys()):
-                if symbol not in signals.columns or pd.isna(signals.loc[date, symbol]):
-                    # Close position
-                    pos = self._positions.pop(symbol)
+                sig = signals.loc[date, symbol] if symbol in signals.columns else np.nan
+                pos = self._positions[symbol]
+                pos_sign = 1 if pos.side == 'long' else -1
+                want_close = (symbol not in signals.columns) or pd.isna(sig) or (sig == 0)
+                flipped = (not want_close) and (np.sign(sig) != pos_sign)
+                if want_close or flipped:
+                    self._positions.pop(symbol)
                     exit_price = current_prices[symbol]
-                    
+
                     trade = Trade(
                         symbol=symbol,
                         entry_date=pos.entry_date,
@@ -326,10 +344,20 @@ class EnhancedBacktestEngine(IBacktestEngine):
                         entry_price=pos.entry_price,
                         exit_price=exit_price
                     )
-                    
+
                     # Calculate P&L
                     trade.pnl = pos.unrealized_pnl(exit_price)
-                    
+                    # MAE/MFE from the recorded price path (H-10)
+                    _path = self._price_history.get(symbol, [pos.entry_price, exit_price])
+                    _arr = np.asarray(_path, dtype=float)
+                    if pos.side == 'long':
+                        trade.mae = float((_arr.min() - pos.entry_price) * pos.quantity)
+                        trade.mfe = float((_arr.max() - pos.entry_price) * pos.quantity)
+                    else:
+                        trade.mae = float((pos.entry_price - _arr.max()) * pos.quantity)
+                        trade.mfe = float((pos.entry_price - _arr.min()) * pos.quantity)
+                    self._price_history.pop(symbol, None)
+
                     # Calculate costs
                     cost_info = self.cost_model.calculate_cost(
                         exit_price, -pos.quantity,
@@ -337,7 +365,7 @@ class EnhancedBacktestEngine(IBacktestEngine):
                     )
                     trade.transaction_costs = cost_info['total']
                     trade.slippage = cost_info['slippage']
-                    
+
                     # Update capital
                     capital += trade.pnl - trade.transaction_costs
                     self._trades.append(trade)
@@ -348,13 +376,31 @@ class EnhancedBacktestEngine(IBacktestEngine):
                 if pd.isna(signal) or signal == 0:
                     continue
                 
-                # Determine position size
-                target_value = capital * self.max_position_size * abs(signal)
+                # Cap total gross exposure at max_gross_exposure * capital
+                # (positions are notional) and throttle daily turnover via
+                # max_portfolio_turnover.
+                gross = sum(
+                    abs(pp.quantity) * float(current_prices.get(pp.symbol, 0.0) or 0.0)
+                    for pp in self._positions.values()
+                )
+                room = max(0.0, self.max_gross_exposure * capital - gross)
+
+                # Determine position size (capped by gross exposure + turnover)
+                target_value = min(capital * self.max_position_size * abs(signal), room)
+                if target_value <= 0:
+                    continue
+
+                # Turnover throttle: skip new entries once the day's traded
+                # notional would exceed max_portfolio_turnover * capital.
+                day_notional = getattr(self, "_day_traded_notional", 0.0)
+                if day_notional + target_value > self.max_portfolio_turnover * capital:
+                    continue
+
                 current_price = current_prices[symbol]
-                
+
                 if current_price <= 0:
                     continue
-                
+
                 quantity = target_value / current_price
                 
                 # Check if we already have a position
@@ -376,7 +422,9 @@ class EnhancedBacktestEngine(IBacktestEngine):
                 )
                 
                 self._positions[symbol] = pos
+                self._price_history[symbol] = [current_price]
                 capital -= cost_info['total']
+                self._day_traded_notional = getattr(self, "_day_traded_notional", 0.0) + target_value
             
             # Calculate portfolio value
             portfolio_value = capital
@@ -414,11 +462,13 @@ class EnhancedBacktestEngine(IBacktestEngine):
     
     def _calculate_metrics(self, returns: pd.Series) -> Dict[str, float]:
         """Calculate comprehensive performance metrics."""
-        if len(returns) == 0 or returns.sum() == 0:
+        if len(returns) < 2:
             return {}
         
         # Basic stats
         total_return = (self._equity_curve.iloc[-1] / self.initial_capital) - 1
+        # NOTE (L-2): arithmetic annualization (mean * 252) for annual_return,
+        # matching Benchmark alpha; metrics.calculate_annualized_return uses CAGR.
         ann_return = returns.mean() * 252
         vol = returns.std() * np.sqrt(252)
         
@@ -428,10 +478,11 @@ class EnhancedBacktestEngine(IBacktestEngine):
         
         sharpe = (excess_returns.mean() / excess_returns.std()) * np.sqrt(252) if excess_returns.std() > 0 else 0
         
-        # Downside deviation for Sortino
-        downside_returns = excess_returns[excess_returns < 0]
-        downside_std = downside_returns.std() if len(downside_returns) > 0 else 0
-        sortino = (excess_returns.mean() / downside_std) * np.sqrt(252) if downside_std > 0 else 0
+        # Downside deviation for Sortino (sqrt(mean(min(excess-target,0)^2)) over all obs)
+        target_return = 0.0
+        downside = np.minimum(excess_returns - target_return, 0.0)
+        downside_dev = np.sqrt(np.mean(downside ** 2)) * np.sqrt(252)
+        sortino = (excess_returns.mean() / downside_dev) if downside_dev > 0 else 0.0
         
         # Drawdown
         cum_returns = (1 + returns).cumprod()

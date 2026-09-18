@@ -123,8 +123,10 @@ class MacroDataLoader:
         return cpi_series.pct_change(periods=12) * 100
     
     def calculate_gdp_growth(self, gdp_series: pd.Series) -> pd.Series:
-        """Calculate YoY GDP growth rate."""
-        return gdp_series.pct_change(periods=4) * 100  # Quarterly data
+        """Calculate YoY GDP growth rate (4 quarters or 12 months)."""
+        freq = pd.infer_freq(gdp_series.index)
+        periods = 4 if (freq and str(freq).startswith("Q")) else 12
+        return gdp_series.pct_change(periods=periods) * 100
 
 
 class RegimeDetector:

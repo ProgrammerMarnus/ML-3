@@ -58,6 +58,7 @@ class AlertRule:
         cooldown_minutes: Minimum time between alerts for this rule
         message_template: Template for alert message (can use {value}, {threshold}, etc.)
         enabled: Whether the rule is active
+        threshold: Optional threshold value used in message templates
     """
     name: str
     metric_name: str
@@ -67,6 +68,7 @@ class AlertRule:
     message_template: str = "{metric_name} triggered alert: {value}"
     enabled: bool = True
     last_triggered: Optional[datetime] = None
+    threshold: Optional[float] = None
     
     def check_and_trigger(self, value: float, context: Optional[Dict[str, Any]] = None) -> Optional[Alert]:
         """
@@ -96,7 +98,7 @@ class AlertRule:
             message = self.message_template.format(
                 metric_name=self.metric_name,
                 value=value,
-                threshold=getattr(self, 'threshold', None),
+                threshold=self.threshold,
             )
             
             return Alert(
@@ -336,6 +338,7 @@ class AlertManager:
         Returns:
             Condition function
         """
+        operator = operator.strip()
         operators = {
             ">": lambda x: x > threshold,
             "<": lambda x: x < threshold,
@@ -346,7 +349,7 @@ class AlertManager:
         }
         
         if operator not in operators:
-            raise ValueError(f"Invalid operator: {operator}")
+            raise ValueError(f"Invalid operator: {operator!r}")
         
         return operators[operator]
     
@@ -378,6 +381,7 @@ def create_sharpe_ratio_alert(min_sharpe: float = -1.0) -> AlertRule:
         condition=AlertManager.threshold_condition(min_sharpe, "<"),
         severity=AlertSeverity.WARNING,
         message_template="Sharpe ratio dropped to {value} (below {threshold})",
+        threshold=min_sharpe,
         cooldown_minutes=1440,  # 24 hours
     )
 
@@ -390,6 +394,7 @@ def create_drawdown_alert(max_drawdown: float = -0.1) -> AlertRule:
         condition=AlertManager.threshold_condition(max_drawdown, "<"),
         severity=AlertSeverity.CRITICAL,
         message_template="Drawdown reached {value} (breached {threshold})",
+        threshold=max_drawdown,
         cooldown_minutes=60,
     )
 
@@ -402,6 +407,7 @@ def create_prediction_error_alert(max_error: float = 0.1) -> AlertRule:
         condition=AlertManager.threshold_condition(max_error, ">"),
         severity=AlertSeverity.WARNING,
         message_template="Prediction error {value} exceeded threshold {threshold}",
+        threshold=max_error,
         cooldown_minutes=30,
     )
 
@@ -414,5 +420,6 @@ def create_volume_spike_alert(multiplier: float = 3.0) -> AlertRule:
         condition=AlertManager.threshold_condition(multiplier, ">"),
         severity=AlertSeverity.INFO,
         message_template="Volume spike detected: {value}x average",
+        threshold=multiplier,
         cooldown_minutes=60,
     )

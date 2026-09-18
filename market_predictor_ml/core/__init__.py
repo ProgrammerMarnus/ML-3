@@ -124,13 +124,18 @@ class IBacktestEngine(ABC):
     @abstractmethod
     def run(
         self,
-        predictions: np.ndarray,
-        actuals: np.ndarray,
-        positions: np.ndarray,
+        signals: pd.DataFrame,
         prices: pd.DataFrame,
+        volumes: Optional[pd.DataFrame] = None,
         **kwargs
     ) -> Dict[str, Any]:
-        """Run backtest and return performance metrics."""
+        """Run a portfolio backtest over signals and prices (M-10).
+
+        The signature matches the concrete portfolio engine (see
+        backtest/enhanced_engine.py::EnhancedBacktestEngine.run): `signals`,
+        `prices` and `volumes` are date x symbol frames. Vectorised engines
+        that operate on numpy arrays should define their own interface.
+        """
         pass
     
     @abstractmethod

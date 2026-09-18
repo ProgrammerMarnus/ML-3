@@ -10,6 +10,7 @@ Connects ML models to the trading engine by:
 
 import logging
 from datetime import datetime, time, timedelta
+from zoneinfo import ZoneInfo
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 from enum import Enum
@@ -114,7 +115,8 @@ class LivePredictor:
         Returns:
             Current market status
         """
-        now = datetime.now()
+        # Evaluate against US/Eastern regardless of host timezone
+        now = datetime.now(ZoneInfo("America/New_York"))
         weekday = now.weekday()
         
         # Check for weekend
@@ -471,7 +473,6 @@ def create_live_predictor(
         Configured LivePredictor instance
     """
     from ..data.providers import create_data_provider
-    from ..config.enhanced_settings import EnhancedSettings
     
     # Load or create components
     if data_loader is None:
@@ -479,14 +480,14 @@ def create_live_predictor(
         data_loader = create_data_provider(provider_type)
     
     if feature_pipeline is None:
-        # TODO: Load feature pipeline from config/artifact
-        feature_pipeline = FeaturePipeline([])
-        logger.warning("Using empty feature pipeline - configure and load from artifact")
+        raise ValueError(
+            "feature_pipeline must be provided (load a trained FeaturePipeline from artifact)"
+        )
     
     if model_registry is None:
-        # TODO: Load model registry from config/artifact
-        model_registry = InMemoryModelRegistry()
-        logger.warning("Using empty model registry - configure and load models")
+        raise ValueError(
+            "model_registry must be provided (load trained models into InMemoryModelRegistry)"
+        )
     
     # Extract configuration
     symbols = config.get('symbols', [])

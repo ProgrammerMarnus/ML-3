@@ -8,7 +8,7 @@ Provides:
 - Config versioning for experiment tracking
 """
 
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 import os
@@ -23,7 +23,8 @@ class DataConfig(BaseModel):
     default_interval: str = "1d"
     return_horizons: List[int] = Field(default_factory=lambda: [1, 5, 21])
     
-    @validator('default_start_date', 'default_end_date')
+    @field_validator('default_start_date', 'default_end_date')
+    @classmethod
     def validate_date_format(cls, v):
         try:
             datetime.strptime(v, '%Y-%m-%d')
@@ -46,19 +47,20 @@ class FeatureConfig(BaseModel):
     winsorize_upper: float = 99.0
     variance_threshold: float = 1e-4
     
-    @validator('winsorize_lower', 'winsorize_upper')
-    def validate_percentiles(cls, v, field):
-        if field.name == 'winsorize_lower' and not (0 <= v <= 100):
+    @field_validator('winsorize_lower', 'winsorize_upper')
+    @classmethod
+    def validate_percentiles(cls, v, info):
+        if info.field_name == 'winsorize_lower' and not (0 <= v <= 100):
             raise ValueError("winsorize_lower must be between 0 and 100")
-        if field.name == 'winsorize_upper' and not (0 <= v <= 100):
+        if info.field_name == 'winsorize_upper' and not (0 <= v <= 100):
             raise ValueError("winsorize_upper must be between 0 and 100")
         return v
     
-    @validator('winsorize_upper')
-    def validate_upper_greater_than_lower(cls, v, values):
-        if 'winsorize_lower' in values and v <= values['winsorize_lower']:
+    @model_validator(mode='after')
+    def validate_upper_greater_than_lower(self):
+        if self.winsorize_upper <= self.winsorize_lower:
             raise ValueError("winsorize_upper must be greater than winsorize_lower")
-        return v
+        return self
 
 
 class LabelConfig(BaseModel):
@@ -70,7 +72,8 @@ class LabelConfig(BaseModel):
     triple_barrier_stop_loss: float = 0.03
     risk_adjust_window: int = 21
     
-    @validator('triple_barrier_profit_target', 'triple_barrier_stop_loss')
+    @field_validator('triple_barrier_profit_target', 'triple_barrier_stop_loss')
+    @classmethod
     def validate_thresholds(cls, v):
         if not (0 < v < 1):
             raise ValueError("Thresholds must be between 0 and 1")
@@ -98,13 +101,15 @@ class ModelConfig(BaseModel):
     # Logistic baseline
     logistic_C: float = 1.0
     
-    @validator('lightgbm_learning_rate')
+    @field_validator('lightgbm_learning_rate')
+    @classmethod
     def validate_learning_rate(cls, v):
         if not (0 < v <= 1):
             raise ValueError("Learning rate must be between 0 and 1")
         return v
     
-    @validator('lightgbm_subsample', 'lightgbm_colsample_bytree')
+    @field_validator('lightgbm_subsample', 'lightgbm_colsample_bytree')
+    @classmethod
     def validate_fractions(cls, v):
         if not (0 < v <= 1):
             raise ValueError("Fraction must be between 0 and 1")
@@ -121,13 +126,15 @@ class DecisionConfig(BaseModel):
     signal_strength_power: float = 1.0
     prediction_threshold: float = 0.0
     
-    @validator('max_position')
+    @field_validator('max_position')
+    @classmethod
     def validate_max_position(cls, v):
         if v <= 0 or v > 1:
             raise ValueError("max_position must be between 0 and 1")
         return v
     
-    @validator('kelly_fraction')
+    @field_validator('kelly_fraction')
+    @classmethod
     def validate_kelly_fraction(cls, v):
         if not (0 <= v <= 1):
             raise ValueError("kelly_fraction must be between 0 and 1")
@@ -157,13 +164,15 @@ class BacktestConfig(BaseModel):
     max_position_size: Optional[float] = None
     allow_shorting: bool = True
     
-    @validator('transaction_cost', 'slippage', 'commission_rate')
+    @field_validator('transaction_cost', 'slippage', 'commission_rate')
+    @classmethod
     def validate_costs(cls, v):
         if v < 0:
             raise ValueError("Costs cannot be negative")
         return v
     
-    @validator('n_splits')
+    @field_validator('n_splits')
+    @classmethod
     def validate_n_splits(cls, v):
         if v < 2:
             raise ValueError("n_splits must be at least 2")
@@ -185,9 +194,7 @@ class Config(BaseModel):
     created_at: str = Field(default_factory=lambda: datetime.now().isoformat())
     environment: str = "development"
     
-    class Config:
-        validate_assignment = True
-        extra = 'allow'  # Allow additional fields
+    model_config = ConfigDict(validate_assignment=True, extra='allow')
     
     @classmethod
     def from_dict(cls, config_dict: Dict[str, Any]) -> 'Config':
@@ -212,7 +219,7 @@ class Config(BaseModel):
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary."""
-        return self.dict()
+        return self.model_dump()
     
     def save_yaml(self, path: str):
         """Save configuration to YAML file."""
@@ -229,28 +236,46 @@ class Config(BaseModel):
     def override_from_env(self, prefix: str = "MPML_"):
         """
         Override configuration values from environment variables.
-        
+
         Environment variables should be named like:
         MPML_DATA_DEFAULT_START_DATE=2020-01-01
         MPML_MODEL_LIGHTGBM_LEARNING_RATE=0.01
+        MPML_FEATURES_MOMENTUM_PERIODS=[5,10,20]
+
+        Top-level scalar fields (e.g. MPML_ENVIRONMENT) and one level of
+        nesting are supported. Values are parsed as JSON so list fields such
+        as momentum_periods can be overridden (L-7).
         """
         import json
-        
-        for field_name, field_value in self.dict().items():
-            if isinstance(field_value, dict):
-                for subfield, subvalue in field_value.items():
-                    env_var = f"{prefix}{field_name.upper()}_{subfield.upper()}"
-                    env_value = os.environ.get(env_var)
-                    if env_value is not None:
-                        try:
-                            # Try to parse as JSON for complex types
-                            parsed_value = json.loads(env_value)
-                        except (json.JSONDecodeError, TypeError):
-                            # Keep as string for simple types
-                            parsed_value = env_value
-                        
-                        setattr(getattr(self, field_name), subfield, parsed_value)
-        
+
+        def _parse(raw_value):
+            try:
+                return json.loads(raw_value)
+            except (json.JSONDecodeError, TypeError):
+                return raw_value
+
+        for field_name, field_value in self.model_dump().items():
+            # Top-level scalar field (e.g. environment)
+            if not isinstance(field_value, dict):
+                env_value = os.environ.get(f"{prefix}{field_name.upper()}")
+                if env_value is not None:
+                    try:
+                        setattr(self, field_name, _parse(env_value))
+                    except (ValueError, TypeError):
+                        pass
+                continue
+
+            # Nested config section (one level below the root)
+            for subfield in field_value:
+                env_var = f"{prefix}{field_name.upper()}_{subfield.upper()}"
+                env_value = os.environ.get(env_var)
+                if env_value is None:
+                    continue
+                try:
+                    setattr(getattr(self, field_name), subfield, _parse(env_value))
+                except (ValueError, TypeError):
+                    pass
+
         return self
 
 
@@ -308,11 +333,11 @@ def load_config(
     """
     # Start with environment-specific defaults
     if environment == "production":
-        config = PRODUCTION_CONFIG.copy()
+        config = PRODUCTION_CONFIG.model_copy()
     elif environment == "development":
-        config = DEVELOPMENT_CONFIG.copy()
+        config = DEVELOPMENT_CONFIG.model_copy()
     else:
-        config = DEFAULT_CONFIG.copy()
+        config = DEFAULT_CONFIG.model_copy()
     
     # Override with file config if provided
     if config_path:

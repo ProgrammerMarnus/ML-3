@@ -64,29 +64,26 @@ def calculate_sortino_ratio(
     returns: Union[np.ndarray, pd.Series],
     risk_free_rate: float = 0.0,
     annualization_factor: int = 252,
+    target_return: float = 0.0,
 ) -> float:
     """
     Calculate Sortino Ratio.
-    
+
     Like Sharpe but only penalizes downside volatility.
     """
-    returns_array = np.asarray(returns)
-    excess_returns = returns_array - risk_free_rate
-    
-    # Downside deviation
-    downside_returns = returns_array[returns_array < 0]
-    if len(downside_returns) == 0:
-        return np.inf
-    
-    downside_std = np.std(downside_returns)
-    
-    if downside_std == 0:
-        return np.inf
-    
-    annualized_return = np.mean(excess_returns) * annualization_factor
-    annualized_downside = downside_std * np.sqrt(annualization_factor)
-    
-    return annualized_return / annualized_downside
+    returns = pd.Series(returns).dropna()
+    if len(returns) < 2:
+        return 0.0
+
+    rf_per = risk_free_rate / annualization_factor
+    excess = returns - rf_per
+    downside = np.minimum(excess - target_return, 0.0)
+
+    downside_dev = np.sqrt(np.mean(downside ** 2)) * np.sqrt(annualization_factor)
+    if downside_dev == 0:
+        return 0.0 if excess.mean() <= 0 else float("inf")
+
+    return (excess.mean() * annualization_factor) / downside_dev
 
 
 def calculate_calmar_ratio(

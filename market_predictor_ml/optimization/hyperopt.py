@@ -253,17 +253,22 @@ class HyperparameterOptimizer:
             else:
                 X_train_arr = np.array(X_train)
                 
-            X_train_processed = winsorize_features(
-                X_train_arr,
-                lower_percentile=config.features.winsorize_lower,
-                upper_percentile=config.features.winsorize_upper,
-            )
+            # Winsorize train and remember per-column clip bounds (fit on train only)
+            lo = config.features.winsorize_lower
+            hi = config.features.winsorize_upper
+            lower_bounds = np.percentile(X_train_arr, lo, axis=0)
+            upper_bounds = np.percentile(X_train_arr, hi, axis=0)
+            X_train_w = np.clip(X_train_arr, lower_bounds, upper_bounds)
+
             X_train_processed, keep_indices = remove_near_zero_variance_features(
-                X_train_processed,
+                X_train_w,
                 threshold=config.features.variance_threshold,
             )
+            lower_bounds = lower_bounds[np.array(keep_indices)]
+            upper_bounds = upper_bounds[np.array(keep_indices)]
             feature_names = [X.columns[i] for i in keep_indices]
-            X_train_processed, _, _ = standardize_features(X_train_processed)
+
+            X_train_processed, mu, sigma = standardize_features(X_train_processed)
             
             # Create and train model
             from ..models import get_model
@@ -286,13 +291,10 @@ class HyperparameterOptimizer:
                 X_test_arr = X_test.values
             else:
                 X_test_arr = np.array(X_test)
-            X_test_processed = X_test_arr[:, keep_indices]
-            X_test_processed = winsorize_features(
-                X_test_processed,
-                lower_percentile=config.features.winsorize_lower,
-                upper_percentile=config.features.winsorize_upper,
-            )
-            X_test_processed, _, _ = standardize_features(X_test_processed)
+            X_test_arr_sel = X_test_arr[:, keep_indices]
+            X_test_w = np.clip(X_test_arr_sel, lower_bounds, upper_bounds)
+            sigma_safe = np.where(sigma == 0, 1.0, sigma)
+            X_test_processed = (X_test_w - mu) / sigma_safe
             
             # Predict
             y_pred = model.predict(X_test_processed)
@@ -313,8 +315,8 @@ class HyperparameterOptimizer:
                 method=position_method,
                 max_position=getattr(config.decision, 'fixed_position_size', 0.02) * 50,  # Scale to reasonable position size
                 threshold=getattr(config.decision, 'signal_threshold', 0.0),
-                volatility_target=getattr(config.decision, 'volatility_target', 0.15),
-                kelly_fraction=getattr(config.decision, 'kelly_fraction', 0.5),
+                target_vol=getattr(config.decision, 'volatility_target', 0.15),
+                fraction=getattr(config.decision, 'kelly_fraction', 0.5),
             )
             
             # Calculate portfolio returns
@@ -541,22 +543,25 @@ class HyperparameterOptimizer:
 
 def run_optimization_example():
     """Example usage of the hyperparameter optimizer."""
-    from ..config.settings import Config, BacktestConfig
-    
-    # Base configuration
-    config = Config(
-        ticker="AAPL",
-        start_date="2018-01-01",
-        end_date="2023-12-31",
-        model={"model_type": "lightgbm"},
-        features={},
-        labels={}
+    from ..config.settings import (
+        Config, BacktestConfig, DataConfig, ModelConfig,
     )
-    
+
+    # Base configuration. Config is a dataclass with data/features/labels/model/
+    # decision/backtest sections; the old ticker=/start_date= kwargs raised
+    # TypeError as written (L-10).
+    config = Config(
+        data=DataConfig(
+            default_start_date="2018-01-01",
+            default_end_date="2023-12-31",
+        ),
+        model=ModelConfig(),
+    )
+
     backtest_config = BacktestConfig(
         n_splits=3,
         commission_rate=0.001,
-        slippage_bps=5
+        slippage=0.0005,  # 5 bps
     )
     
     # Optimization configuration
