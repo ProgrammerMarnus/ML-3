@@ -2206,3 +2206,28 @@ expected variables.
 This is a research and engineering framework, not financial advice.
 Trading involves risk, and most market prediction models fail out-of-sample.
 Always validate extensively, use conservative assumptions, and start with small capital or paper trading.
+
+
+====================================================================
+46. DOCUMENTATION MAP
+====================================================================
+
+- README.md (this file) - the original design spec and methodology.
+- ARCHITECTURE.md - module map, usage examples, migration guide
+  (merged from the former ARCHITECTURE_IMPROVEMENTS.md and
+  ARCHITECTURE_IMPLEMENTATION_SUMMARY.md).
+- LIVE_TRADING_IMPLEMENTATION.md - build record and hardening notes for
+  the live trading engine (OMS, brokers, risk, engine).
+- market_predictor_ml/CHANGELOG.md - release history; version 0.4.0 records
+  the remediation of all 51 findings from Deep-Audit-ML3-1.txt.
+- Deep-Audit-ML3-1.txt - the code audit that drove the 0.4.0 hardening pass
+  (historical reference).
+- paper_trading.yaml / paper_trading.example.yaml - engine-harness config;
+  the example is the template, copy it and customise (see run_paper_trader.py).
+- .env.example - template for Alpaca paper keys and the USE_RL / USE_GNN flags.
+
+Methodology status: the lagged-position convention specified in §27
+(`position.shift(1) * actual_return`) is implemented in
+market_predictor_ml/backtest/engine.py::run_walk_forward_backtest, and the
+portfolio engine (backtest/enhanced_engine.py) closes/flips positions on the
+same next-bar principle with explicit cost modelling.
