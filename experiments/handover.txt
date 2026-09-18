@@ -1,0 +1,87 @@
+MARKET PREDICTOR ML — HANDOVER (2026-09-18)
+Codebase: market_predictor_ml v0.4.0 @ 39b932b, branch main (up to date with origin/main)
+Plan: EXECUTION_PLAN.md — "Validate Before You Build"
+
+=== 1. WHERE WE ARE ===
+Gate 0: PASS (env runs, smoke test completes).
+Gate 1: FAIL — 0 of 5 tickers pass at h=1 AND 0 of 5 at h=21,
+out-of-sample, net of costs (0.10% commission + 0.05% slippage).
+Per plan rule "FAIL (0 pass) -> STOP": Phase 2 NOT authorized.
+Paper trading NOT authorized. No RL/GNN/hyperopt.
+Tests: passing (40/40 baseline; 45/45 after F2 regression tests).
+
+=== 2. WHAT WAS MEASURED (Phase 1 + Phase 1c) ===
+Universe SPY, QQQ, AAPL, MSFT, GOOGL; 2015-01-01 -> 2024-12-31.
+Walk-forward n_splits=5, test_size=252, purge=5, embargo=5.
+LightGBM 500 trees, lr 0.05, depth 6, 31 leaves, subsample/colsample 0.8.
+Sizing volatility_adjusted (target_vol 0.02, clip +-1.0). Costs 0.15%/turnover.
+Corrected net Sharpe h=1: SPY -2.23, QQQ -0.63, AAPL -0.74, MSFT +0.03, GOOGL -0.88.
+Corrected net Sharpe h=21: SPY -0.89, QQQ -0.69, AAPL +0.56, MSFT -0.08, GOOGL -0.75.
+Buy&Hold on identical fold dates: +16.7% to +25.1% p.a. Strategy: ~0%.
+Phase 1c signal test (IC/rankIC/hit-rate, early-stopping ON, random control):
+Pooled (n=12600): IC -0.0135, rankIC -0.0077, hit 49.26% vs base 50.53%,
+skill -1.27pp, t_eff -1.51 -> NO SIGNAL. Random control IC -0.0042.
+One narrow real signal: MSFT h=1 (IC +0.087, rankIC +0.064, 5/5 folds
+positive, spread +0.0139 t=+2.59, skill +1.11pp); AAPL h=1 close behind
+(IC +0.084, t_eff +2.99, 5/5). MSFT h=1 gross Sharpe +0.91 -> net +0.03:
+costs consume 97% (drag 0.0797% vs gross 0.0821%; vol 0.0897%).
+h=21 anti-predictive at ~0 cost -> plan lever R5 (longer horizon) FALSIFIED.
+
+=== 3. WORKING TREE (uncommitted) ===
+Modified: market_predictor_ml/backtest/engine.py (F2 fix only),
+market_predictor_ml/tests/test_core.py (F2 regression tests only).
+Untracked: experiments/ (research artifacts), repomix-output.xml (incidental).
+F2 fix LANDED+tested: profit_factor = gross_profit/gross_loss (standard,
+matches enhanced_engine.py + monitoring/metrics.py). Old -avg_win/avg_loss
+kept as payoff_ratio. New keys: gross_profit, gross_loss. No-loss -> inf;
+no-win -> 0.0. 5 new TestEconomicMetrics tests incl. cross-engine agreement.
+F6/F7 fix NOT LANDED (stopped mid-task): data/loader.py UNCHANGED (83 lines,
+no snapshot/data_cache refs). Data still live-fetched via yfinance every run;
+runs not bit-reproducible (AAPL h=1 Sharpe -0.4808 vs -0.6250, identical code).
+
+=== 4. DEFECTS F1-F7 ===
+F1 label/P&L mismatch: 21d label scored as daily return; overlap inflates
+Sharpe ~3.4-3.9x (AAPL "pass" +1.63 -> +0.48). Diagnosis only; engine untouched.
+F2 payoff-ratio-as-PF: FIXED (was >1.2 on losers; SPY reported 1.09, true 0.60).
+F3 gate PF>1.2 unevaluable: resolved by F2 fix.
+F4 sizing units incoherent: book ~0.4% invested (~1% ann vol). Scale-invariant:
+does NOT move Sharpe/PF gates; matters for absolute interp + paper.
+F5 no early stopping in fold loop (500 trees; train_model stops iter 1/500).
+Fixed ONLY inside signal-test harness; production loop untouched.
+F6 data never pinned (loader.py:34 live yfinance). F7 0.14 Sharpe jitter
+(28% of gate threshold); thread-count ruled out.
+
+=== 5. FILES (experiments/) ===
+experiments/README.md; experiments/.gitignore;
+experiments/phase1/GATE1_VERDICT.md <- decision record, read first;
+run_validation.py (plan 3.1 script, mismatched P&L);
+run_horizon_matched.py (corrected P&L, h=1+h=21);
+run_signal_test.py (Phase 1c IC/rankIC/hit-rate + random control);
+summarize_gate1.py; check_determinism.py; check_thread_determinism.py;
+check_data_stability.py; validation_2026-09-18.json;
+validation_horizon_matched_2026-09-18.json; signal_test_2026-09-18.json.
+Plan Step 1.3 enhanced_engine cross-check NOT run (independent P&L path in
+run_horizon_matched.py served same purpose).
+
+=== 6. NEXT (strict order, do not skip) ===
+0. FREEZE DATA FIRST: one hashed snapshot (parquet + sha256 manifest); loader
+reads snapshot by default with explicit --refetch flag. Pre-snapshot numbers
+are not reproducible.
+1. Fix F1 (P&L matched to label horizon) -> 2. Fix F4 (sizing units) ->
+3. Fix F5 (early stopping in production fold loop) -> 4. Re-run Gate 1.
+5. Only if gross signal appears, plan s9 in evidence order: R1
+market-neutralise (most promising untested) > R2 trade less / higher threshold
+(only remaining cost-side lever; pre-reg: net Sharpe>0.5 AND net PF>1.2 OOS on
+MSFT+AAPL, h in {1,2,3,5}; h=21 falsified, do not retest) > R3 triple-barrier
+label (plausible, untested) > R7 ACCEPT THE NULL (live; pooled IC~0).
+R5 longer horizon = FALSIFIED. R6 ensemble = premature.
+6. Do NOT: Phase 2/3, paper trade, RL/GNN/hyperopt, new providers, intraday,
+relaxed limits, buy-and-hold comparisons, drop purge/embargo.
+
+=== 7. RESUME ===
+1. Read experiments/phase1/GATE1_VERDICT.md (s9.7 F4 math; s9.6 pre-reg R2).
+2. git status / git diff --stat to confirm tree matches s3 above.
+3. Snapshot as ONE clean file-level edit to data/loader.py + snapshot script;
+verify: python3 -m pytest market_predictor_ml/tests -q.
+4. Re-run run_horizon_matched.py, then run_signal_test.py; compare JSONs.
+

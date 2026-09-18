@@ -12,6 +12,7 @@ from market_predictor_ml.data.loader import download_stock_data, preprocess_data
 from market_predictor_ml.features.engineering import create_all_features, get_feature_columns
 from market_predictor_ml.features.labels import compute_future_returns, compute_direction_labels
 from market_predictor_ml.utils.preprocessing import check_data_leakage
+from market_predictor_ml.backtest.engine import compute_economic_metrics
 
 
 class TestDataLoader(unittest.TestCase):
@@ -162,6 +163,85 @@ class TestPipelineIntegration(unittest.TestCase):
         self.assertIn('metrics', results)
         self.assertIn('equity_curve', results)
         self.assertIsInstance(results['metrics'], dict)
+
+
+class TestEconomicMetrics(unittest.TestCase):
+    """Regression tests for economic metric definitions."""
+
+    def test_profit_factor_is_gross_profit_over_gross_loss(self):
+        """
+        profit_factor must be gross profit / gross loss.
+
+        Fixture: 4 wins of +1.0 and 6 losses of -1.0.
+            gross_profit = 4.0, gross_loss = 6.0 -> profit_factor = 0.6667
+        Regression: the old implementation returned -avg_win / avg_loss,
+        which is an average-payoff ratio and yields 1.0 here, hiding the loss.
+        """
+        returns = np.array([1.0] * 4 + [-1.0] * 6)
+        m = compute_economic_metrics(returns)
+
+        self.assertAlmostEqual(m['gross_profit'], 4.0, places=10)
+        self.assertAlmostEqual(m['gross_loss'], 6.0, places=10)
+        self.assertAlmostEqual(m['profit_factor'], 4.0 / 6.0, places=10)
+        self.assertAlmostEqual(m['win_rate'], 0.4, places=10)
+        self.assertAlmostEqual(m['avg_win'], 1.0, places=10)
+        self.assertAlmostEqual(m['avg_loss'], -1.0, places=10)
+
+        # The payoff ratio is preserved separately and is NOT the profit factor.
+        self.assertAlmostEqual(m['payoff_ratio'], 1.0, places=10)
+        self.assertNotAlmostEqual(m['profit_factor'], m['payoff_ratio'], places=6)
+
+    def test_profit_factor_below_one_on_losing_system(self):
+        """
+        A system that loses money must report profit_factor < 1.0 even when its
+        average win exceeds its average loss (the exact failure mode that made
+        a losing strategy look acceptable on Gate 1).
+        """
+        returns = np.array([0.02] * 3 + [-0.019] * 7)
+        m = compute_economic_metrics(returns)
+
+        self.assertAlmostEqual(m['payoff_ratio'], 0.02 / 0.019, places=10)
+        self.assertGreater(m['payoff_ratio'], 1.0)      # misleading on its own
+        self.assertLess(m['profit_factor'], 1.0)        # the truth
+        self.assertAlmostEqual(
+            m['profit_factor'], (3 * 0.02) / (7 * 0.019), places=10
+        )
+        self.assertLess(m['total_return'], 0.0)
+
+    def test_profit_factor_infinite_when_no_losses(self):
+        """All-positive returns mean zero gross loss."""
+        m = compute_economic_metrics(np.array([0.01, 0.02, 0.03]))
+        self.assertEqual(m['gross_loss'], 0.0)
+        self.assertTrue(np.isinf(m['profit_factor']))
+        self.assertAlmostEqual(m['win_rate'], 1.0, places=10)
+
+    def test_profit_factor_zero_when_no_wins(self):
+        """All-negative returns mean zero gross profit."""
+        m = compute_economic_metrics(np.array([-0.01, -0.02, -0.03]))
+        self.assertEqual(m['gross_profit'], 0.0)
+        self.assertAlmostEqual(m['profit_factor'], 0.0, places=10)
+        self.assertAlmostEqual(m['win_rate'], 0.0, places=10)
+
+    def test_profit_factor_matches_enhanced_engine_definition(self):
+        """
+        The two backtest engines must agree on profit_factor for the same
+        return series (they previously used different definitions).
+        """
+        from market_predictor_ml.backtest.enhanced_engine import Benchmark
+
+        returns = np.array([0.01, -0.02, 0.03, -0.01, 0.02, -0.03, 0.015])
+        engine_pf = compute_economic_metrics(returns)['profit_factor']
+
+        branded = Benchmark.calculate_metrics(pd.Series(returns)) \
+            if hasattr(Benchmark, 'calculate_metrics') else None
+        if branded is None:
+            # Compute the reference definition directly.
+            wins = returns > 0
+            ref = returns[wins].sum() / abs(returns[~wins].sum())
+        else:
+            ref = branded['profit_factor']
+
+        self.assertAlmostEqual(engine_pf, ref, places=10)
 
 
 if __name__ == '__main__':

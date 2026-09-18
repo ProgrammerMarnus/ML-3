@@ -1,0 +1,103 @@
+{
+  "generated_at": "2026-09-18",
+  "config": {
+    "tickers": [
+      "SPY",
+      "QQQ",
+      "AAPL",
+      "MSFT",
+      "GOOGL"
+    ],
+    "start": "2015-01-01",
+    "end": "2024-12-31",
+    "backtest": {
+      "n_splits": 5,
+      "test_size": 252,
+      "purge_size": 5,
+      "embargo_size": 5,
+      "transaction_cost": 0.001,
+      "slippage": 0.0005,
+      "risk_free_rate": 0.02
+    },
+    "engine": "market_predictor_ml.backtest.engine (WalkForwardSplit + run_walk_forward_backtest)"
+  },
+  "measurement_warning": "INVALID AS AN ECONOMIC MEASUREMENT. The engine multiplies the position by y_test[1:], where y is Target_RiskAdj_21d - a 21-day forward risk-adjusted return - and treats it as a daily return. Overlapping 21-day windows inflate the reported Sharpe by roughly sqrt(21). See run_horizon_matched.py / validation_horizon_matched_*.json for the corrected numbers.",
+  "results": {
+    "SPY": {
+      "total_return": -0.9971889154894783,
+      "annual_return": -1.1217602601380943,
+      "volatility": 0.3175853606670608,
+      "sharpe_ratio": -3.532153553242924,
+      "sortino_ratio": -4.112173378939189,
+      "max_drawdown": 0.9971985712789411,
+      "calmar_ratio": -1.124911619858619,
+      "win_rate": 0.4111111111111111,
+      "profit_factor": 0.6135924251561616,
+      "turnover": 0.007512903127536194,
+      "verdict": "FAIL"
+    },
+    "QQQ": {
+      "total_return": -0.9226512982249278,
+      "annual_return": -0.48666078699374016,
+      "volatility": 0.22067558669870999,
+      "sharpe_ratio": -2.205322275445819,
+      "sortino_ratio": -2.4095010698363897,
+      "max_drawdown": 0.9589637605350191,
+      "calmar_ratio": -0.507486108465898,
+      "win_rate": 0.4103174603174603,
+      "profit_factor": 0.8684165779600511,
+      "turnover": 0.005957766029117667,
+      "verdict": "FAIL"
+    },
+    "AAPL": {
+      "total_return": 1.7916255075445773,
+      "annual_return": 0.21353290764020563,
+      "volatility": 0.12861083608121401,
+      "sharpe_ratio": 1.6603026163780306,
+      "sortino_ratio": 2.654071423425858,
+      "max_drawdown": 0.5025867056102227,
+      "calmar_ratio": 0.4248677994395846,
+      "win_rate": 0.5666666666666667,
+      "profit_factor": 1.1687845319995183,
+      "turnover": 0.004515402103662249,
+      "verdict": "FAIL"
+    },
+    "MSFT": {
+      "total_return": 0.15504424488608648,
+      "annual_return": 0.031760931356654386,
+      "volatility": 0.07666651671996072,
+      "sharpe_ratio": 0.4142738279432641,
+      "sortino_ratio": 0.6254012463062675,
+      "max_drawdown": 0.4293005955354702,
+      "calmar_ratio": 0.07398296598456547,
+      "win_rate": 0.4658730158730159,
+      "profit_factor": 1.2457346636454134,
+      "turnover": 0.00420459855018645,
+      "verdict": "FAIL"
+    },
+    "GOOGL": {
+      "total_return": -0.8948919147116488,
+      "annual_return": -0.4374315497252926,
+      "volatility": 0.15859977637359426,
+      "sharpe_ratio": -2.758084278094366,
+      "sortino_ratio": -2.9419076144894696,
+      "max_drawdown": 0.9590531015996744,
+      "calmar_ratio": -0.45610774731416714,
+      "win_rate": 0.4238095238095238,
+      "profit_factor": 0.703691208002475,
+      "turnover": 0.004318993496297205,
+      "verdict": "FAIL"
+    }
+  },
+  "gate1": {
+    "per_ticker_pass": {
+      "SPY": "FAIL",
+      "QQQ": "FAIL",
+      "AAPL": "FAIL",
+      "MSFT": "FAIL",
+      "GOOGL": "FAIL"
+    },
+    "pass_count": 0,
+    "decision_rule": "PASS >= 3 of 5 tickers -> Phase 2; MARGINAL 1-2 -> Phase 3 first; FAIL 0 -> stop"
+  }
+}

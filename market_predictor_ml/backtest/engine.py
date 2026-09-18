@@ -264,7 +264,22 @@ def compute_economic_metrics(
     win_rate = np.sum(wins) / len(returns) if len(returns) > 0 else 0
     avg_win = np.mean(returns[wins]) if np.sum(wins) > 0 else 0
     avg_loss = np.mean(returns[~wins]) if np.sum(~wins) > 0 else 0
-    profit_factor = -avg_win / avg_loss if avg_loss != 0 else np.inf
+
+    # Profit factor = gross profit / gross loss. This is the standard
+    # definition and matches the other two implementations in this codebase
+    # (backtest/enhanced_engine.py and monitoring/metrics.py). The previous
+    # `-avg_win / avg_loss` was an AVERAGE-payoff ratio, which ignores how
+    # often wins and losses occur and can exceed 1.0 on a losing system.
+    gross_profit = float(returns[wins].sum()) if np.sum(wins) > 0 else 0.0
+    gross_loss = abs(float(returns[~wins].sum())) if np.sum(~wins) > 0 else 0.0
+    if gross_loss > 0:
+        profit_factor = gross_profit / gross_loss
+    else:
+        profit_factor = np.inf if gross_profit > 0 else 0.0
+
+    # Keep the average-payoff ratio, but under its own name so it cannot be
+    # mistaken for a profit factor.
+    payoff_ratio = -avg_win / avg_loss if avg_loss != 0 else np.inf
     
     # Turnover (if positions provided)
     turnover = None
@@ -284,6 +299,9 @@ def compute_economic_metrics(
         'avg_win': avg_win,
         'avg_loss': avg_loss,
         'profit_factor': profit_factor,
+        'payoff_ratio': payoff_ratio,
+        'gross_profit': gross_profit,
+        'gross_loss': gross_loss,
         'turnover': turnover,
         'n_trades': len(returns),
     }
